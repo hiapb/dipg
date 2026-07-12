@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 APP="dipguard"
-VERSION="3.3.0"
+VERSION="3.5.0"
 
 BASE_DIR="/etc/${APP}"
 NODES_DIR="${BASE_DIR}/nodes"
@@ -364,12 +364,15 @@ load_node() {
 
     GET_IP_TIMEOUT=30
     CHANGE_CMD_TIMEOUT=90
-    IP_POLL_INTERVAL=20
     COOLDOWN_SECONDS=600
 
     # 文件由脚本生成，仅 root 可写。
     # shellcheck disable=SC1090
     source "${NODE_DIR}/config"
+
+    # v3.5 起，换 IP 后复用正常检测周期，不再单独设置查询间隔。
+    # 旧配置中的 IP_POLL_INTERVAL 会被忽略。
+    unset IP_POLL_INTERVAL 2>/dev/null || true
 
     mkdir -p "$NODE_STATE"
     chmod 700 "$NODE_STATE"
@@ -390,7 +393,6 @@ save_node_config() {
         printf 'FAIL_ROUNDS=%q\n' "$FAIL_ROUNDS"
         printf 'GET_IP_TIMEOUT=%q\n' "$GET_IP_TIMEOUT"
         printf 'CHANGE_CMD_TIMEOUT=%q\n' "$CHANGE_CMD_TIMEOUT"
-        printf 'IP_POLL_INTERVAL=%q\n' "$IP_POLL_INTERVAL"
         printf 'COOLDOWN_SECONDS=%q\n' "$COOLDOWN_SECONDS"
     } > "$file"
     chmod 600 "$file"
@@ -655,7 +657,7 @@ trigger_change() {
 旧 IP：${current_ip}
 原因：${reason}
 今日次数：${count_text}
-状态：持续查询新 IP；旧 IP 未变化前不会自动重复提交。"
+状态：按 ${CHECK_INTERVAL} 秒检测周期持续解析并验证新 IP；完成前不会自动重复提交。"
 
     return 0
 }
@@ -671,7 +673,7 @@ poll_pending() {
     now="$(date +%s)"
     last_poll="$(read_number_state "${NODE_STATE}/last_pending_poll" 0)"
 
-    if ((now - last_poll < IP_POLL_INTERVAL)); then
+    if ((now - last_poll < CHECK_INTERVAL)); then
         return 0
     fi
 
@@ -686,7 +688,15 @@ poll_pending() {
 
     if [[ "$current_ip" == "$OLD_IP" ]]; then
         elapsed=$((now - STARTED_AT))
-        log_msg "$NAME" "仍在等待 IP 变化：$current_ip；已等待 $(format_duration "$elapsed")"
+        log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")"
+        return 0
+    fi
+
+    # DDNS 已变化后，继续使用该任务原本的 Ping/TCP 检测规则验证新 IP。
+    # 只有新 IP 真正可用，才判定换 IP 完成。
+    if ! check_reachable "$current_ip"; then
+        elapsed=$((now - STARTED_AT))
+        log_msg "$NAME" "检测到新 IP：$current_ip，但当前尚不可用；继续等待"
         return 0
     fi
 
@@ -695,12 +705,13 @@ poll_pending() {
     printf '0\n' > "${NODE_STATE}/fail_rounds"
     printf '%s\n' "$now" > "${NODE_STATE}/last_change_completed"
 
-    log_msg "$NAME" "换 IP 完成：$OLD_IP -> $current_ip；耗时 $(format_duration "$elapsed")"
+    log_msg "$NAME" "换 IP 完成且检测可用：$OLD_IP -> $current_ip；耗时 $(format_duration "$elapsed")"
 
-    tg_notify "✅ 换 IP 已生效
+    tg_notify "✅ 换 IP 已生效并通过检测
 任务：${NAME} (${NODE_ID})
 旧 IP：${OLD_IP}
 新 IP：${current_ip}
+验证方式：${CHECK_MODE}
 生效耗时：$(format_duration "$elapsed")
 原因：${CHANGE_REASON:-未知}"
 
@@ -973,7 +984,7 @@ tg_node_detail() {
         pending_text="等待中
 旧 IP：${OLD_IP}
 已等待：$(format_duration "$(($(date +%s) - STARTED_AT))")
-查询间隔：${IP_POLL_INTERVAL} 秒"
+检查周期：${CHECK_INTERVAL} 秒（与正常检测一致）"
     fi
 
     cat <<EOF
@@ -988,8 +999,8 @@ Ping 超时：${PING_TIMEOUT} 秒
 连续失败阈值：${fails}/${FAIL_ROUNDS}
 TCP 端口：${CHECK_PORT}
 今日换 IP：${daily_text}
-自动换 IP冷却：${COOLDOWN_SECONDS} 秒
-新 IP 查询间隔：${IP_POLL_INTERVAL} 秒
+自动换 IP 冷却：${COOLDOWN_SECONDS} 秒
+换 IP 后检查：复用检测周期 ${CHECK_INTERVAL} 秒
 
 换 IP 状态：
 ${pending_text}
@@ -1062,7 +1073,7 @@ TCP 端口：${CHECK_PORT}
 Ping 超时：${PING_TIMEOUT} 秒
 失败轮数：${FAIL_ROUNDS}
 每日上限：${MAX_DAILY}（0=不限）
-新 IP 查询：${IP_POLL_INTERVAL} 秒
+换 IP 后检查：跟随检测周期
 换 IP 冷却：${COOLDOWN_SECONDS} 秒
 
 点击要修改的项目。
@@ -1091,7 +1102,6 @@ tg_settings_keyboard() {
                 {text:"🔢 每日上限",callback_data:("p:"+$id+":max_daily")}
             ],
             [
-                {text:"🔎 新IP查询",callback_data:("p:"+$id+":ip_poll_interval")},
                 {text:"🧊 换IP冷却",callback_data:("p:"+$id+":cooldown_seconds")}
             ],
             [
@@ -1111,7 +1121,6 @@ tg_setting_title() {
         ping_min_replies) echo "最低 Ping 回复数" ;;
         ping_timeout) echo "每个 Ping 超时" ;;
         fail_rounds) echo "连续失败轮数" ;;
-        ip_poll_interval) echo "新 IP 查询间隔" ;;
         cooldown_seconds) echo "换 IP 冷却时间" ;;
         *) echo "$1" ;;
     esac
@@ -1130,7 +1139,6 @@ tg_setting_value() {
         ping_min_replies) echo "$PING_MIN_REPLIES" ;;
         ping_timeout) echo "$PING_TIMEOUT" ;;
         fail_rounds) echo "$FAIL_ROUNDS" ;;
-        ip_poll_interval) echo "$IP_POLL_INTERVAL" ;;
         cooldown_seconds) echo "$COOLDOWN_SECONDS" ;;
         *) return 1 ;;
     esac
@@ -1152,7 +1160,6 @@ tg_setting_text() {
         ping_min_replies) note="不能大于当前每轮 Ping 次数 ${PING_COUNT}。" ;;
         ping_timeout) note="范围 1-20 秒。" ;;
         fail_rounds) note="范围 1-100 轮。" ;;
-        ip_poll_interval) note="换 IP 后查询新 IP 的间隔，范围 5-3600 秒。" ;;
         cooldown_seconds) note="范围 0-86400 秒，0 表示无冷却。" ;;
         *) note="" ;;
     esac
@@ -1210,9 +1217,6 @@ tg_setting_keyboard() {
             ;;
         max_daily)
             tg_numeric_keyboard "$id" "$key" 0 3 5 10
-            ;;
-        ip_poll_interval)
-            tg_numeric_keyboard "$id" "$key" 10 20 30 60
             ;;
         cooldown_seconds)
             tg_numeric_keyboard "$id" "$key" 0 300 600 1800
@@ -1320,11 +1324,6 @@ tg_set_node_value() {
             is_uint "$value" && ((value >= 1 && value <= 100)) ||
                 { echo "范围：1-100"; return 1; }
             FAIL_ROUNDS="$value"
-            ;;
-        ip_poll_interval)
-            is_uint "$value" && ((value >= 5 && value <= 3600)) ||
-                { echo "范围：5-3600 秒"; return 1; }
-            IP_POLL_INTERVAL="$value"
             ;;
         cooldown_seconds)
             is_uint "$value" && ((value <= 86400)) ||
@@ -1988,14 +1987,18 @@ configure_node() {
 
         GET_IP_TIMEOUT=30
         CHANGE_CMD_TIMEOUT=90
-        IP_POLL_INTERVAL=20
         COOLDOWN_SECONDS=600
     fi
 
     echo
-    echo "所有检测参数都可单独设置。"
-    echo "换 IP 后没有等待超时：会一直查询，直到 IP 真正变化。"
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║                 VPS 任务高级设置                    ║"
+    echo "╚══════════════════════════════════════════════════════╝"
     echo
+    echo "说明：换 IP 后按正常检测周期解析 DDNS，并用相同的"
+    echo "      Ping/TCP 规则验证新 IP；未完成前不会重复换。"
+    echo
+    echo "── ① 基本信息 ───────────────────────────────────────"
 
     NAME="$(prompt_default "任务显示名称" "$NAME")"
 
@@ -2005,8 +2008,11 @@ configure_node() {
         ENABLED=0
     fi
 
-    MAX_DAILY="$(prompt_uint "每天最多换 IP 次数，0=不限" "$MAX_DAILY")"
-    CHECK_INTERVAL="$(prompt_range "每隔多少秒检测一轮" "$CHECK_INTERVAL" 10 86400)"
+    MAX_DAILY="$(prompt_uint "每日最多换 IP 次数，0=不限" "$MAX_DAILY")"
+
+    echo
+    echo "── ② 可用性检测 ─────────────────────────────────────"
+    CHECK_INTERVAL="$(prompt_range "检测周期（秒）" "$CHECK_INTERVAL" 10 86400)"
     CHECK_MODE="$(prompt_mode "$CHECK_MODE")"
 
     if [[ "$CHECK_MODE" != "ping" ]]; then
@@ -2025,15 +2031,20 @@ configure_node() {
         PING_TIMEOUT="$(prompt_range "每个 Ping 最长等待几秒" "$PING_TIMEOUT" 1 20)"
     fi
 
-    FAIL_ROUNDS="$(prompt_range "连续失败多少轮才自动换 IP" "$FAIL_ROUNDS" 1 100)"
-    GET_IP_TIMEOUT="$(prompt_range "查询当前 IP 命令超时秒数" "$GET_IP_TIMEOUT" 1 300)"
-    CHANGE_CMD_TIMEOUT="$(prompt_range "换 IP 命令执行超时秒数" "$CHANGE_CMD_TIMEOUT" 1 600)"
-    IP_POLL_INTERVAL="$(prompt_range "提交后每隔多少秒查询一次新 IP" "$IP_POLL_INTERVAL" 5 3600)"
-    COOLDOWN_SECONDS="$(prompt_range "自动换 IP 的最小间隔秒数，0=不限制" "$COOLDOWN_SECONDS" 0 86400)"
+    FAIL_ROUNDS="$(prompt_range "连续失败多少轮后自动换 IP" "$FAIL_ROUNDS" 1 100)"
 
     echo
-    echo "查询 IP 命令必须能输出当前公网 IPv4。"
-    echo "可以直接输出 IP，也可以输出包含 IP 的 JSON。"
+    echo "── ③ 换 IP 策略 ─────────────────────────────────────"
+    GET_IP_TIMEOUT="$(prompt_range "查询当前 IP 命令超时（秒）" "$GET_IP_TIMEOUT" 1 300)"
+    CHANGE_CMD_TIMEOUT="$(prompt_range "执行换 IP 命令超时（秒）" "$CHANGE_CMD_TIMEOUT" 1 600)"
+    COOLDOWN_SECONDS="$(prompt_range "两次自动换 IP 最小间隔（秒），0=不限制" "$COOLDOWN_SECONDS" 0 86400)"
+
+    echo
+    echo "── ④ IP 来源与执行命令 ──────────────────────────────"
+    echo "查询命令必须输出目标 VPS 当前公网 IPv4。"
+    echo "已使用 DDNS 时，可使用："
+    echo "  getent ahostsv4 你的域名 | awk 'NR==1{print \$1}'"
+    echo
 
     if [[ "$editing" == "1" ]]; then
         echo "当前查询命令：$old_get"
@@ -2072,6 +2083,170 @@ configure_node() {
 
     rm -f "${NODE_STATE}/last_check"
     echo "任务配置已保存：$id"
+}
+
+quick_add_node() {
+    local id source_type source_value get_cmd change_cmd quoted_value current_ip
+    local keep_failed
+
+    echo
+    echo "========================================================"
+    echo "              快速添加 VPS 任务"
+    echo "========================================================"
+    echo "只需填写：名称、DDNS/查询方式、每日上限、换 IP 命令。"
+    echo "检测参数自动使用推荐值，之后可在菜单 3 中调整。"
+    echo
+
+    while true; do
+        read -r -p "任务标识（例如 hkt）: " id
+
+        valid_node_id "$id" || {
+            echo "只能使用字母、数字、下划线和短横线，最长 32 位。"
+            continue
+        }
+
+        node_exists "$id" && {
+            echo "该任务已经存在。"
+            continue
+        }
+
+        break
+    done
+
+    NODE_ID="$id"
+    NODE_DIR="${NODES_DIR}/${id}"
+    NODE_STATE="${STATE_DIR}/${id}"
+
+    NAME="$(prompt_default "任务显示名称" "$id")"
+    ENABLED=1
+    MAX_DAILY="$(prompt_uint "每天最多换 IP 次数，0=不限" "5")"
+
+    # 推荐默认参数，不在快速向导里逐项询问。
+    CHECK_INTERVAL=30
+    CHECK_MODE="ping"
+    CHECK_PORT=443
+    PING_COUNT=3
+    PING_MIN_REPLIES=1
+    PING_TIMEOUT=3
+    FAIL_ROUNDS=3
+    GET_IP_TIMEOUT=30
+    CHANGE_CMD_TIMEOUT=90
+    COOLDOWN_SECONDS=600
+
+    echo
+    echo "请选择如何查询这台 VPS 当前的动态 IP："
+    echo "  1) 动态域名 / DDNS（最简单，推荐）"
+    echo "  2) 服务商查询 IP 的 HTTP 接口"
+    echo "  3) 自定义查询命令（高级）"
+    echo
+    echo "注意：ip.3322.net、4.ipw.cn 等“本机 IP”网站不能填在这里。"
+    echo "脚本运行在国内机上，填写它们只会得到国内机自己的 IP。"
+
+    while true; do
+        read -r -p "请选择 [1-3]: " source_type
+        case "$source_type" in
+            1|2|3) break ;;
+            *) echo "只能输入 1、2 或 3。" ;;
+        esac
+    done
+
+    case "$source_type" in
+        1)
+            while true; do
+                read -r -p "输入动态域名，例如 hkt.example.com: " source_value
+                if [[ "$source_value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]] ||
+                   [[ "$source_value" =~ ^[A-Za-z0-9]$ ]]; then
+                    break
+                fi
+                echo "域名格式不正确，不要带 http://、路径或端口。"
+            done
+
+            quoted_value="$(printf '%q' "$source_value")"
+            get_cmd="getent ahostsv4 ${quoted_value} | awk 'NR==1{print \$1}'"
+            ;;
+
+        2)
+            while true; do
+                read -r -p "输入服务商查询当前 IP 的接口 URL: " source_value
+
+                case "$source_value" in
+                    https://myip.ipip.net*|http://myip.ipip.net*|\
+                    https://ddns.oray.com/checkip*|http://ddns.oray.com/checkip*|\
+                    https://ip.3322.net*|http://ip.3322.net*|\
+                    https://4.ipw.cn*|http://4.ipw.cn*|\
+                    https://v4.yinghualuo.cn/bejson*|http://v4.yinghualuo.cn/bejson*)
+                        echo "这个网址返回的是调用者本机 IP，不是目标 VPS IP，不能使用。"
+                        continue
+                        ;;
+                    http://*|https://*)
+                        break
+                        ;;
+                    *)
+                        echo "必须以 http:// 或 https:// 开头。"
+                        ;;
+                esac
+            done
+
+            quoted_value="$(printf '%q' "$source_value")"
+            get_cmd="curl -4fsSL --max-time 20 ${quoted_value}"
+            ;;
+
+        3)
+            read -r -p "粘贴查询当前 IP 的一行命令: " get_cmd
+            [[ -n "$get_cmd" ]] || {
+                echo "查询命令不能为空。"
+                return 1
+            }
+            ;;
+    esac
+
+    echo
+    echo "粘贴你已经可以成功执行的“更换 IP”一行命令。"
+    read -r -p "换 IP 命令: " change_cmd
+
+    [[ -n "$change_cmd" ]] || {
+        echo "换 IP 命令不能为空。"
+        return 1
+    }
+
+    mkdir -p "$NODE_DIR" "$NODE_STATE"
+    chmod 700 "$NODE_DIR" "$NODE_STATE"
+
+    save_node_config "${NODE_DIR}/config"
+    printf '%s\n' "$get_cmd" > "${NODE_DIR}/get_ip.cmd"
+    printf '%s\n' "$change_cmd" > "${NODE_DIR}/change_ip.cmd"
+    chmod 600 "${NODE_DIR}/get_ip.cmd" "${NODE_DIR}/change_ip.cmd"
+
+    rm -f "${NODE_STATE}/last_check"
+
+    echo
+    echo "正在测试 IP 获取……"
+
+    load_node "$id"
+
+    if current_ip="$(get_current_ip)"; then
+        printf '%s\n' "$current_ip" > "${NODE_STATE}/last_seen_ip"
+
+        echo "✅ 添加成功"
+        echo "任务：$NAME ($id)"
+        echo "当前 IP：$current_ip"
+        echo "每日上限：$MAX_DAILY（0=不限）"
+        echo
+        echo "推荐默认检测："
+        echo "  每 30 秒检测一轮"
+        echo "  每轮 Ping 3 次"
+        echo "  至少 1 次回复即正常"
+        echo "  连续失败 3 轮后换 IP"
+        echo "  换 IP 后继续按每 30 秒周期解析 DDNS"
+        echo "  新 IP 通过相同 Ping/TCP 检测后才算完成"
+        echo "  完成前绝不重复自动提交"
+    else
+        echo "⚠️ 任务已保存，但当前没有查询到有效 IPv4。"
+        echo "查询命令输出："
+        cat "${NODE_STATE}/last_get_ip_error" 2>/dev/null || true
+        echo
+        echo "请检查动态域名或服务商接口，然后使用菜单 8 重新测试。"
+    fi
 }
 
 add_node() {
@@ -2777,8 +2952,8 @@ menu() {
 ========================================================
   1) 安装/更新程序并启动服务
 
-  2) 添加 VPS 任务
-  3) 修改 VPS 任务及全部参数
+  2) 快速添加 VPS 任务（推荐）
+  3) 高级修改 VPS 任务及全部参数
   4) 删除 VPS 任务
   5) 启用 VPS 任务
   6) 停用 VPS 任务
@@ -2813,7 +2988,7 @@ EOF
                 install_service
                 ;;
             2)
-                add_node
+                quick_add_node
                 systemctl restart "$APP" 2>/dev/null || true
                 ;;
             3)
