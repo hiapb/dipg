@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 APP="dipguard"
-VERSION="3.2.0"
+VERSION="3.3.0"
 
 BASE_DIR="/etc/${APP}"
 NODES_DIR="${BASE_DIR}/nodes"
@@ -24,8 +24,12 @@ STATE_DIR="/var/lib/${APP}"
 LOG_FILE="/var/log/${APP}.log"
 BIN_PATH="/usr/local/sbin/${APP}"
 SERVICE_FILE="/etc/systemd/system/${APP}.service"
+SCRIPT_URL="https://raw.githubusercontent.com/hiapb/dipg/main/install.sh"
+INSTALLED_PACKAGES_FILE="${BASE_DIR}/installed-packages"
 
-SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+# 普通文件运行时可直接复制自身；bash <(curl ...) 时该路径通常指向
+# /dev/fd 或 /proc/.../pipe，不能当作普通文件安装。
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
 # ---------------------------------------------------------------------------
 # 基础函数
@@ -2523,25 +2527,85 @@ EOF
 # ---------------------------------------------------------------------------
 
 install_service() {
-    echo "安装依赖……"
+    local packages=(
+        bash
+        curl
+        jq
+        iputils-ping
+        netcat-openbsd
+        util-linux
+        coreutils
+        grep
+        gawk
+    )
+    local newly_missing=()
+    local pkg
+    local source_file=""
+    local temp_source=""
+
+    echo "检查依赖……"
+
+    for pkg in "${packages[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null |
+            grep -q '^install ok installed$'; then
+            newly_missing+=("$pkg")
+        fi
+    done
+
+    # 在 apt 执行前记录原本缺失的依赖。即使后续安装阶段失败，
+    # 彻底卸载时也能知道哪些包可能由本脚本安装。
+    if ((${#newly_missing[@]} > 0)); then
+        {
+            [[ -f "$INSTALLED_PACKAGES_FILE" ]] &&
+                cat "$INSTALLED_PACKAGES_FILE"
+            printf '%s\n' "${newly_missing[@]}"
+        } | awk 'NF && !seen[$0]++' > "${INSTALLED_PACKAGES_FILE}.tmp"
+
+        mv -f "${INSTALLED_PACKAGES_FILE}.tmp" "$INSTALLED_PACKAGES_FILE"
+        chmod 600 "$INSTALLED_PACKAGES_FILE"
+    fi
 
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        bash \
-        curl \
-        jq \
-        iputils-ping \
-        netcat-openbsd \
-        util-linux \
-        coreutils \
-        grep \
-        gawk
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
 
-    if [[ "$SELF_PATH" != "$BIN_PATH" ]]; then
-        install -m 700 "$SELF_PATH" "$BIN_PATH"
+    if [[ -n "$SELF_PATH" &&
+          -f "$SELF_PATH" &&
+          -r "$SELF_PATH" &&
+          "$SELF_PATH" != "$BIN_PATH" ]]; then
+        source_file="$SELF_PATH"
+    elif [[ "$SELF_PATH" == "$BIN_PATH" && -f "$BIN_PATH" ]]; then
+        source_file="$BIN_PATH"
+    else
+        echo "检测到当前通过 bash <(curl ...) 运行，重新下载脚本本体……"
+        temp_source="$(mktemp /tmp/dipguard-install.XXXXXX)"
+
+        if ! curl -fsSL \
+            --retry 3 \
+            --retry-delay 2 \
+            --connect-timeout 15 \
+            "$SCRIPT_URL" \
+            -o "$temp_source"; then
+            rm -f "$temp_source"
+            echo "下载脚本本体失败，安装已停止。"
+            return 1
+        fi
+
+        if ! bash -n "$temp_source"; then
+            rm -f "$temp_source"
+            echo "下载到的脚本语法校验失败，安装已停止。"
+            return 1
+        fi
+
+        source_file="$temp_source"
+    fi
+
+    if [[ "$source_file" != "$BIN_PATH" ]]; then
+        install -m 700 "$source_file" "$BIN_PATH"
     else
         chmod 700 "$BIN_PATH"
     fi
+
+    [[ -n "$temp_source" ]] && rm -f "$temp_source"
 
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -2563,7 +2627,15 @@ EOF
     systemctl daemon-reload
     systemctl enable --now "$APP"
 
+    if ! systemctl is-active --quiet "$APP"; then
+        echo "服务启动失败，最近日志如下："
+        journalctl -u "$APP" -n 50 --no-pager || true
+        return 1
+    fi
+
     echo "安装/更新完成，服务已启动。"
+    echo "程序路径：$BIN_PATH"
+    echo "配置目录：$BASE_DIR"
     echo "以后打开菜单：dipguard"
 }
 
@@ -2578,24 +2650,114 @@ show_logs() {
     tail -n 100 -f "$LOG_FILE"
 }
 
-uninstall_all() {
-    local answer
+remove_program_files() {
+    systemctl disable --now "$APP" 2>/dev/null || true
+    pkill -f "^${BIN_PATH} --daemon$" 2>/dev/null || true
+    pkill -f "^/bin/bash ${BIN_PATH} --daemon$" 2>/dev/null || true
+    pkill -f "^/usr/bin/bash ${BIN_PATH} --daemon$" 2>/dev/null || true
 
-    if ! prompt_yes_no "确定卸载程序？默认保留任务配置" "n"; then
-        return
+    rm -f \
+        "/etc/systemd/system/${APP}.service" \
+        "/etc/systemd/system/${APP}.timer" \
+        "/etc/systemd/system/${APP}@.service" \
+        "/etc/systemd/system/${APP}@.timer" \
+        "/etc/systemd/system/multi-user.target.wants/${APP}.service" \
+        "/etc/systemd/system/timers.target.wants/${APP}.timer" \
+        "/lib/systemd/system/${APP}.service" \
+        "/usr/lib/systemd/system/${APP}.service" \
+        "/etc/cron.d/${APP}" \
+        "/etc/logrotate.d/${APP}" \
+        "$BIN_PATH"
+
+    systemctl daemon-reload
+    systemctl reset-failed "$APP" 2>/dev/null || true
+}
+
+uninstall_all() {
+    local choice answer
+    local tracked_packages=()
+
+    echo
+    echo "请选择卸载方式："
+    echo "  1) 只卸载程序，保留 VPS 任务和 Telegram 配置"
+    echo "  2) 彻底卸载，删除程序、服务、配置、状态和日志"
+    echo "  0) 取消"
+    echo
+
+    while true; do
+        read -r -p "请输入选项 [0-2]: " choice
+        case "$choice" in
+            0)
+                echo "已取消。"
+                return 0
+                ;;
+            1|2)
+                break
+                ;;
+            *)
+                echo "只能输入 0、1 或 2。"
+                ;;
+        esac
+    done
+
+    if [[ "$choice" == "1" ]]; then
+        if ! prompt_yes_no "确认卸载程序并保留配置" "n"; then
+            echo "已取消。"
+            return 0
+        fi
+
+        remove_program_files
+        echo "程序和 systemd 服务已删除。"
+        echo "保留配置：$BASE_DIR"
+        echo "保留状态：$STATE_DIR"
+        echo "保留日志：$LOG_FILE"
+        return 0
     fi
 
-    systemctl disable --now "$APP" 2>/dev/null || true
-    rm -f "$SERVICE_FILE" "$BIN_PATH"
-    systemctl daemon-reload
+    read -r -p "彻底删除全部数据，请输入 DELETE 确认: " answer
+    if [[ "$answer" != "DELETE" ]]; then
+        echo "确认内容不正确，已取消。"
+        return 0
+    fi
 
-    read -r -p "同时删除全部任务配置、状态和日志请输入 DELETE，否则直接回车: " answer
+    if [[ -f "$INSTALLED_PACKAGES_FILE" ]]; then
+        mapfile -t tracked_packages < <(
+            awk 'NF && !seen[$0]++' "$INSTALLED_PACKAGES_FILE"
+        )
+    fi
 
-    if [[ "$answer" == "DELETE" ]]; then
-        rm -rf "$BASE_DIR" "$STATE_DIR" "$LOG_FILE"
-        echo "程序和全部数据已删除。"
+    remove_program_files
+
+    rm -rf \
+        "$BASE_DIR" \
+        "$STATE_DIR" \
+        "$LOG_FILE" \
+        "/run/${APP}" \
+        "/var/run/${APP}"
+
+    find /tmp -maxdepth 1 -type f \
+        \( -name 'dipguard-install.*' -o -name 'dipguard-self.*' \) \
+        -delete 2>/dev/null || true
+
+    echo "程序、systemd 服务、配置、状态和日志已彻底删除。"
+
+    if ((${#tracked_packages[@]} > 0)); then
+        echo
+        echo "以下依赖在安装时被记录为原本未安装："
+        printf '  %s\n' "${tracked_packages[@]}"
+
+        if prompt_yes_no "同时卸载这些由脚本安装的依赖" "n"; then
+            DEBIAN_FRONTEND=noninteractive \
+                apt-get purge -y "${tracked_packages[@]}" || true
+            DEBIAN_FRONTEND=noninteractive \
+                apt-get autoremove -y --purge || true
+            echo "已尝试卸载记录的依赖并清理孤立依赖。"
+        else
+            echo "依赖包已保留，避免影响其他程序。"
+        fi
     else
-        echo "程序已卸载，配置保留在：$BASE_DIR"
+        echo
+        echo "没有依赖安装记录，因此不会自动卸载系统软件包。"
     fi
 }
 
