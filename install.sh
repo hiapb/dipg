@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 APP="dipguard"
-VERSION="3.5.0"
+VERSION="3.6.0"
 
 BASE_DIR="/etc/${APP}"
 NODES_DIR="${BASE_DIR}/nodes"
@@ -353,7 +353,7 @@ load_node() {
     ENABLED=1
     MAX_DAILY=5
 
-    CHECK_INTERVAL=60
+    CHECK_INTERVAL=10
     CHECK_MODE="ping"
     CHECK_PORT=443
 
@@ -1976,7 +1976,7 @@ configure_node() {
         ENABLED=1
         MAX_DAILY=5
 
-        CHECK_INTERVAL=60
+        CHECK_INTERVAL=10
         CHECK_MODE="ping"
         CHECK_PORT=443
 
@@ -2122,7 +2122,7 @@ quick_add_node() {
     MAX_DAILY="$(prompt_uint "每天最多换 IP 次数，0=不限" "5")"
 
     # 推荐默认参数，不在快速向导里逐项询问。
-    CHECK_INTERVAL=30
+    CHECK_INTERVAL=10
     CHECK_MODE="ping"
     CHECK_PORT=443
     PING_COUNT=3
@@ -2139,8 +2139,6 @@ quick_add_node() {
     echo "  2) 服务商查询 IP 的 HTTP 接口"
     echo "  3) 自定义查询命令（高级）"
     echo
-    echo "注意：ip.3322.net、4.ipw.cn 等“本机 IP”网站不能填在这里。"
-    echo "脚本运行在国内机上，填写它们只会得到国内机自己的 IP。"
 
     while true; do
         read -r -p "请选择 [1-3]: " source_type
@@ -2233,11 +2231,11 @@ quick_add_node() {
         echo "每日上限：$MAX_DAILY（0=不限）"
         echo
         echo "推荐默认检测："
-        echo "  每 30 秒检测一轮"
+        echo "  每 10 秒检测一轮"
         echo "  每轮 Ping 3 次"
         echo "  至少 1 次回复即正常"
         echo "  连续失败 3 轮后换 IP"
-        echo "  换 IP 后继续按每 30 秒周期解析 DDNS"
+        echo "  换 IP 后继续按每 10 秒周期解析 DDNS"
         echo "  新 IP 通过相同 Ping/TCP 检测后才算完成"
         echo "  完成前绝不重复自动提交"
     else
