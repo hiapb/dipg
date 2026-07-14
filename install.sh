@@ -3,7 +3,7 @@
 # 功能：
 # - 多 VPS 任务添加、修改、删除、启用、停用
 # - 每台任务独立设置检测周期、Ping 次数、失败轮数、每日换 IP 上限等
-# - DDNS 未变化时不重复提交；新 IP 连续检测失败后自动继续换 IP
+# - DDNS 未变化时不重复提交（可配置超时重试）；新 IP 连续检测失败后自动继续换 IP
 # - Telegram 通知与远程命令控制
 #
 # 运行：
@@ -365,6 +365,7 @@ load_node() {
     GET_IP_TIMEOUT=30
     CHANGE_CMD_TIMEOUT=90
     COOLDOWN_SECONDS=600
+    DDNS_WAIT_TIMEOUT=300
 
     # 文件由脚本生成，仅 root 可写。
     # shellcheck disable=SC1090
@@ -394,6 +395,7 @@ save_node_config() {
         printf 'GET_IP_TIMEOUT=%q\n' "$GET_IP_TIMEOUT"
         printf 'CHANGE_CMD_TIMEOUT=%q\n' "$CHANGE_CMD_TIMEOUT"
         printf 'COOLDOWN_SECONDS=%q\n' "$COOLDOWN_SECONDS"
+        printf 'DDNS_WAIT_TIMEOUT=%q\n' "$DDNS_WAIT_TIMEOUT"
     } > "$file"
     chmod 600 "$file"
 }
@@ -663,7 +665,7 @@ trigger_change() {
 旧 IP：${current_ip}
 原因：${reason}
 今日次数：${count_text}
-状态：DDNS 未变化时只等待；新 IP 连续 ${FAIL_ROUNDS} 轮不通会自动继续换 IP。"
+状态：等待新 IP；超时 ${DDNS_WAIT_TIMEOUT} 秒或新 IP 连续不通时自动继续换。"
 
     return 0
 }
@@ -696,7 +698,34 @@ poll_pending() {
     if [[ "$current_ip" == "$OLD_IP" ]]; then
         clear_pending_validation
         elapsed=$((now - STARTED_AT))
-        log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")"
+        
+        today="$(date +%F)"
+        blocked_date="$(cat "${NODE_STATE}/pending_limit_wait_date" 2>/dev/null || true)"
+
+        if (( DDNS_WAIT_TIMEOUT > 0 && elapsed >= DDNS_WAIT_TIMEOUT )) && [[ "$blocked_date" != "$today" ]]; then
+            log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")，超过超时时间 ${DDNS_WAIT_TIMEOUT} 秒，自动重试换 IP"
+            
+            set +e
+            trigger_change "$current_ip" "DDNS 变化超时 (${DDNS_WAIT_TIMEOUT}秒)" "auto" "1" "1"
+            rc=$?
+            set -e
+            
+            case "$rc" in
+                0)
+                    log_msg "$NAME" "因 DDNS 未变超时，已自动重新提交换 IP"
+                    ;;
+                3)
+                    printf '%s\n' "$today" > "${NODE_STATE}/pending_limit_wait_date"
+                    log_msg "$NAME" "DDNS 超时未变，但今日换 IP 次数已达上限；次日自动继续"
+                    ;;
+                *)
+                    log_msg "$NAME" "自动重新提交换 IP 未成功；等待下个周期重试"
+                    ;;
+            esac
+        else
+            log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")"
+        fi
+        
         return 0
     fi
 
@@ -1032,7 +1061,7 @@ tg_list_text() {
 }
 
 tg_node_detail() {
-    local id="$1" ip count fails pending_text daily_text
+    local id="$1" ip count fails pending_text daily_text ddns_timeout_str
 
     load_node "$id" || return 1
 
@@ -1044,6 +1073,12 @@ tg_node_detail() {
         daily_text="${count}/不限"
     else
         daily_text="${count}/${MAX_DAILY}"
+    fi
+
+    if ((DDNS_WAIT_TIMEOUT == 0)); then
+        ddns_timeout_str="0 (永久等待)"
+    else
+        ddns_timeout_str="${DDNS_WAIT_TIMEOUT} 秒"
     fi
 
     pending_text="无"
@@ -1067,8 +1102,10 @@ Ping 超时：${PING_TIMEOUT} 秒
 TCP 端口：${CHECK_PORT}
 今日换 IP：${daily_text}
 自动换 IP 冷却：${COOLDOWN_SECONDS} 秒
-换 IP 后检查：每 ${CHECK_INTERVAL} 秒验证
-新 IP 失败策略：连续 ${FAIL_ROUNDS} 轮不通自动继续换
+
+换 IP 后检查：跟随检测周期
+新 IP 不通：连续 ${FAIL_ROUNDS} 轮后自动继续换
+DDNS 未变超时：${ddns_timeout_str}
 
 换 IP 状态：
 ${pending_text}
@@ -1141,9 +1178,10 @@ TCP 端口：${CHECK_PORT}
 Ping 超时：${PING_TIMEOUT} 秒
 失败轮数：${FAIL_ROUNDS}
 每日上限：${MAX_DAILY}（0=不限）
+换 IP 冷却：${COOLDOWN_SECONDS} 秒
+DDNS 超时：${DDNS_WAIT_TIMEOUT} 秒（0=永久等待）
 换 IP 后检查：跟随检测周期
 新 IP 不通：连续 ${FAIL_ROUNDS} 轮后自动继续换
-换 IP 冷却：${COOLDOWN_SECONDS} 秒
 
 点击要修改的项目。
 EOF
@@ -1171,7 +1209,8 @@ tg_settings_keyboard() {
                 {text:"🔢 每日上限",callback_data:("p:"+$id+":max_daily")}
             ],
             [
-                {text:"🧊 换IP冷却",callback_data:("p:"+$id+":cooldown_seconds")}
+                {text:"🧊 换IP冷却",callback_data:("p:"+$id+":cooldown_seconds")},
+                {text:"⏱ DDNS超时",callback_data:("p:"+$id+":ddns_wait_timeout")}
             ],
             [
                 {text:"⬅️ 返回任务",callback_data:("n:"+$id)}
@@ -1191,6 +1230,7 @@ tg_setting_title() {
         ping_timeout) echo "每个 Ping 超时" ;;
         fail_rounds) echo "连续失败轮数" ;;
         cooldown_seconds) echo "换 IP 冷却时间" ;;
+        ddns_wait_timeout) echo "DDNS 未变超时" ;;
         *) echo "$1" ;;
     esac
 }
@@ -1209,6 +1249,7 @@ tg_setting_value() {
         ping_timeout) echo "$PING_TIMEOUT" ;;
         fail_rounds) echo "$FAIL_ROUNDS" ;;
         cooldown_seconds) echo "$COOLDOWN_SECONDS" ;;
+        ddns_wait_timeout) echo "$DDNS_WAIT_TIMEOUT" ;;
         *) return 1 ;;
     esac
 }
@@ -1230,6 +1271,7 @@ tg_setting_text() {
         ping_timeout) note="范围 1-20 秒。" ;;
         fail_rounds) note="范围 1-100 轮。" ;;
         cooldown_seconds) note="范围 0-86400 秒，0 表示无冷却。" ;;
+        ddns_wait_timeout) note="范围 0-86400 秒，0 表示永久等待，超时自动重试。" ;;
         *) note="" ;;
     esac
 
@@ -1289,6 +1331,9 @@ tg_setting_keyboard() {
             ;;
         cooldown_seconds)
             tg_numeric_keyboard "$id" "$key" 0 300 600 1800
+            ;;
+        ddns_wait_timeout)
+            tg_numeric_keyboard "$id" "$key" 0 300 600 900
             ;;
         *)
             tg_back_main_keyboard
@@ -1398,6 +1443,11 @@ tg_set_node_value() {
             is_uint "$value" && ((value <= 86400)) ||
                 { echo "范围：0-86400 秒"; return 1; }
             COOLDOWN_SECONDS="$value"
+            ;;
+        ddns_wait_timeout)
+            is_uint "$value" && ((value <= 86400)) ||
+                { echo "范围：0-86400 秒"; return 1; }
+            DDNS_WAIT_TIMEOUT="$value"
             ;;
         *)
             echo "不支持的设置项"
@@ -2057,11 +2107,12 @@ configure_node() {
         GET_IP_TIMEOUT=30
         CHANGE_CMD_TIMEOUT=90
         COOLDOWN_SECONDS=600
+        DDNS_WAIT_TIMEOUT=300
     fi
 
     echo
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║                 VPS 任务高级设置                    ║"
+    echo "║                  VPS 任务高级设置                    ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo
     echo "说明：换 IP 后按正常检测周期解析 DDNS，并用相同的"
@@ -2108,6 +2159,7 @@ configure_node() {
     GET_IP_TIMEOUT="$(prompt_range "查询当前 IP 命令超时（秒）" "$GET_IP_TIMEOUT" 1 300)"
     CHANGE_CMD_TIMEOUT="$(prompt_range "执行换 IP 命令超时（秒）" "$CHANGE_CMD_TIMEOUT" 1 600)"
     COOLDOWN_SECONDS="$(prompt_range "两次自动换 IP 最小间隔（秒），0=不限制" "$COOLDOWN_SECONDS" 0 86400)"
+    DDNS_WAIT_TIMEOUT="$(prompt_range "DDNS 未更新超时时间（秒），0=永久等待" "$DDNS_WAIT_TIMEOUT" 0 86400)"
 
     echo
     echo "── ④ IP 来源与执行命令 ──────────────────────────────"
@@ -2202,6 +2254,7 @@ quick_add_node() {
     GET_IP_TIMEOUT=30
     CHANGE_CMD_TIMEOUT=90
     COOLDOWN_SECONDS=600
+    DDNS_WAIT_TIMEOUT=300
 
     echo
     echo "请选择如何查询这台 VPS 当前的动态 IP："
@@ -2223,7 +2276,7 @@ quick_add_node() {
             while true; do
                 read -r -p "输入动态域名，例如 hkt.example.com: " source_value
                 if [[ "$source_value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]] ||
-                   [[ "$source_value" =~ ^[A-Za-z0-9]$ ]]; then
+                    [[ "$source_value" =~ ^[A-Za-z0-9]$ ]]; then
                     break
                 fi
                 echo "域名格式不正确，不要带 http://、路径或端口。"
@@ -2308,7 +2361,7 @@ quick_add_node() {
         echo "  换 IP 后继续按每 10 秒周期解析 DDNS"
         echo "  新 IP 通过相同 Ping/TCP 检测后才算完成"
         echo "  新 IP 连续 3 轮仍不通会自动继续换 IP"
-        echo "  DDNS 仍为旧 IP 时不会重复提交"
+        echo "  DDNS 超过 300 秒未更新会自动重新换 IP"
     else
         echo "⚠️ 任务已保存，但当前没有查询到有效 IPv4。"
         echo "查询命令输出："
