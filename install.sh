@@ -3,7 +3,7 @@
 # 功能：
 # - 多 VPS 任务添加、修改、删除、启用、停用
 # - 每台任务独立设置检测周期、Ping 次数、失败轮数、每日换 IP 上限等
-# - 换 IP 后无限期等待 IP 真正变化，期间绝不自动重复提交
+# - DDNS 未变化时不重复提交；新 IP 连续检测失败后自动继续换 IP
 # - Telegram 通知与远程命令控制
 #
 # 运行：
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 APP="dipguard"
-VERSION="3.6.0"
+VERSION="3.7.0"
 
 BASE_DIR="/etc/${APP}"
 NODES_DIR="${BASE_DIR}/nodes"
@@ -556,8 +556,13 @@ read_pending() {
     is_ipv4 "$OLD_IP" && is_uint "$STARTED_AT"
 }
 
+clear_pending_validation() {
+    rm -f         "${NODE_STATE}/pending_candidate_ip"         "${NODE_STATE}/pending_candidate_failures"         "${NODE_STATE}/pending_limit_wait_date"
+}
+
 clear_pending() {
     rm -f "${NODE_STATE}/pending" "${NODE_STATE}/last_pending_poll"
+    clear_pending_validation
 }
 
 notify_daily_limit_once() {
@@ -640,8 +645,9 @@ trigger_change() {
     printf '%s\n' "$now" > "${NODE_STATE}/last_trigger"
     printf '%s\n' "$now" > "${NODE_STATE}/last_pending_poll"
 
-    # 手动重试时覆盖旧 pending，从本次提交重新计时。
+    # 手动或自动重试时覆盖旧 pending，从本次提交重新计时。
     write_pending "$current_ip" "$now" "$reason"
+    clear_pending_validation
     printf '0\n' > "${NODE_STATE}/fail_rounds"
 
     if ((MAX_DAILY == 0)); then
@@ -657,13 +663,14 @@ trigger_change() {
 旧 IP：${current_ip}
 原因：${reason}
 今日次数：${count_text}
-状态：按 ${CHECK_INTERVAL} 秒检测周期持续解析并验证新 IP；完成前不会自动重复提交。"
+状态：DDNS 未变化时只等待；新 IP 连续 ${FAIL_ROUNDS} 轮不通会自动继续换 IP。"
 
     return 0
 }
 
 poll_pending() {
     local current_ip now last_poll elapsed
+    local candidate_ip candidate_failures rc today blocked_date
 
     read_pending || {
         clear_pending
@@ -687,33 +694,93 @@ poll_pending() {
     printf '%s\n' "$current_ip" > "${NODE_STATE}/last_seen_ip"
 
     if [[ "$current_ip" == "$OLD_IP" ]]; then
+        clear_pending_validation
         elapsed=$((now - STARTED_AT))
         log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")"
         return 0
     fi
 
-    # DDNS 已变化后，继续使用该任务原本的 Ping/TCP 检测规则验证新 IP。
-    # 只有新 IP 真正可用，才判定换 IP 完成。
-    if ! check_reachable "$current_ip"; then
+    # DDNS 已变化，使用任务原有的 Ping/TCP 规则验证新 IP。
+    if check_reachable "$current_ip"; then
         elapsed=$((now - STARTED_AT))
-        log_msg "$NAME" "检测到新 IP：$current_ip，但当前尚不可用；继续等待"
-        return 0
-    fi
+        clear_pending
+        printf '0\n' > "${NODE_STATE}/fail_rounds"
+        printf '%s\n' "$now" > "${NODE_STATE}/last_change_completed"
 
-    elapsed=$((now - STARTED_AT))
-    clear_pending
-    printf '0\n' > "${NODE_STATE}/fail_rounds"
-    printf '%s\n' "$now" > "${NODE_STATE}/last_change_completed"
+        log_msg "$NAME" "换 IP 完成且检测可用：$OLD_IP -> $current_ip；耗时 $(format_duration "$elapsed")"
 
-    log_msg "$NAME" "换 IP 完成且检测可用：$OLD_IP -> $current_ip；耗时 $(format_duration "$elapsed")"
-
-    tg_notify "✅ 换 IP 已生效并通过检测
+        tg_notify "✅ 换 IP 已生效并通过检测
 任务：${NAME} (${NODE_ID})
 旧 IP：${OLD_IP}
 新 IP：${current_ip}
 验证方式：${CHECK_MODE}
 生效耗时：$(format_duration "$elapsed")
 原因：${CHANGE_REASON:-未知}"
+
+        return 0
+    fi
+
+    # 新 IP 不可用：对同一个候选 IP 统计连续失败轮数。
+    candidate_ip="$(cat "${NODE_STATE}/pending_candidate_ip" 2>/dev/null || true)"
+    candidate_failures="$(
+        read_number_state "${NODE_STATE}/pending_candidate_failures" 0
+    )"
+
+    if [[ "$candidate_ip" != "$current_ip" ]]; then
+        candidate_ip="$current_ip"
+        candidate_failures=1
+        printf '%s\n' "$candidate_ip" > "${NODE_STATE}/pending_candidate_ip"
+    else
+        candidate_failures=$((candidate_failures + 1))
+    fi
+
+    printf '%s\n' "$candidate_failures" >         "${NODE_STATE}/pending_candidate_failures"
+
+    log_msg "$NAME"         "新 IP 检测失败：$current_ip；连续 ${candidate_failures}/${FAIL_ROUNDS} 轮"
+
+    if ((candidate_failures < FAIL_ROUNDS)); then
+        return 0
+    fi
+
+    # 如果今日次数已达上限，只等待日期变化，不每 10 秒重复调用换 IP。
+    today="$(date +%F)"
+    blocked_date="$(
+        cat "${NODE_STATE}/pending_limit_wait_date" 2>/dev/null || true
+    )"
+
+    if [[ "$blocked_date" == "$today" ]]; then
+        return 0
+    fi
+
+    log_msg "$NAME"         "新 IP $current_ip 连续 ${candidate_failures} 轮不可用，自动继续更换 IP"
+
+    set +e
+    trigger_change \
+        "$current_ip" \
+        "更换后的新 IP 连续 ${candidate_failures} 轮不可用" \
+        "auto" \
+        "1" \
+        "1"
+    rc=$?
+    set -e
+
+    case "$rc" in
+        0)
+            log_msg "$NAME" "已自动提交下一次换 IP，坏 IP：$current_ip"
+            ;;
+        3)
+            printf '%s\n' "$today" > \
+                "${NODE_STATE}/pending_limit_wait_date"
+            log_msg "$NAME" \
+                "新 IP 仍不可用，但今日换 IP 次数已达上限；次日自动继续"
+            ;;
+        *)
+            # 命令执行失败时重新累计，避免每个检测周期连续轰炸接口。
+            printf '0\n' > "${NODE_STATE}/pending_candidate_failures"
+            log_msg "$NAME" \
+                "自动继续换 IP 未成功；重新累计 ${FAIL_ROUNDS} 轮后再试"
+            ;;
+    esac
 
     return 0
 }
@@ -1000,7 +1067,8 @@ Ping 超时：${PING_TIMEOUT} 秒
 TCP 端口：${CHECK_PORT}
 今日换 IP：${daily_text}
 自动换 IP 冷却：${COOLDOWN_SECONDS} 秒
-换 IP 后检查：复用检测周期 ${CHECK_INTERVAL} 秒
+换 IP 后检查：每 ${CHECK_INTERVAL} 秒验证
+新 IP 失败策略：连续 ${FAIL_ROUNDS} 轮不通自动继续换
 
 换 IP 状态：
 ${pending_text}
@@ -1074,6 +1142,7 @@ Ping 超时：${PING_TIMEOUT} 秒
 失败轮数：${FAIL_ROUNDS}
 每日上限：${MAX_DAILY}（0=不限）
 换 IP 后检查：跟随检测周期
+新 IP 不通：连续 ${FAIL_ROUNDS} 轮后自动继续换
 换 IP 冷却：${COOLDOWN_SECONDS} 秒
 
 点击要修改的项目。
@@ -1996,7 +2065,8 @@ configure_node() {
     echo "╚══════════════════════════════════════════════════════╝"
     echo
     echo "说明：换 IP 后按正常检测周期解析 DDNS，并用相同的"
-    echo "      Ping/TCP 规则验证新 IP；未完成前不会重复换。"
+    echo "      Ping/TCP 规则验证新 IP。DDNS 未变时只等待；"
+    echo "      新 IP 连续失败达到阈值后会自动继续更换。"
     echo
     echo "── ① 基本信息 ───────────────────────────────────────"
 
@@ -2237,7 +2307,8 @@ quick_add_node() {
         echo "  连续失败 3 轮后换 IP"
         echo "  换 IP 后继续按每 10 秒周期解析 DDNS"
         echo "  新 IP 通过相同 Ping/TCP 检测后才算完成"
-        echo "  完成前绝不重复自动提交"
+        echo "  新 IP 连续 3 轮仍不通会自动继续换 IP"
+        echo "  DDNS 仍为旧 IP 时不会重复提交"
     else
         echo "⚠️ 任务已保存，但当前没有查询到有效 IPv4。"
         echo "查询命令输出："
@@ -2948,7 +3019,7 @@ menu() {
 ========================================================
         Dynamic IP Guard v${VERSION}
 ========================================================
-  1) 安装/更新程序并启动服务
+  1) 安装/更新程序并启动服务1
 
   2) 快速添加 VPS 任务（推荐）
   3) 高级修改 VPS 任务及全部参数
