@@ -607,7 +607,7 @@ normalize_node_config() {
         ((CHANGE_CMD_TIMEOUT >= 1 && CHANGE_CMD_TIMEOUT <= 600)) ||
         CHANGE_CMD_TIMEOUT=90
     is_uint "$COOLDOWN_SECONDS" &&
-        ((COOLDOWN_SECONDS <= 86400)) || COOLDOWN_SECONDS=600
+        ((COOLDOWN_SECONDS <= 86400)) || COOLDOWN_SECONDS=0
     is_uint "$DDNS_WAIT_TIMEOUT" &&
         ((DDNS_WAIT_TIMEOUT <= 86400)) || DDNS_WAIT_TIMEOUT=300
 }
@@ -635,7 +635,7 @@ load_node() {
 
     GET_IP_TIMEOUT=30
     CHANGE_CMD_TIMEOUT=90
-    COOLDOWN_SECONDS=600
+    COOLDOWN_SECONDS=0
     DDNS_WAIT_TIMEOUT=300
 
     # 文件由脚本生成，仅 root 可写。
@@ -2717,11 +2717,10 @@ configure_node() {
     }
 
     if [[ "$editing" == "1" ]]; then
-        printf '\n  %s换 IP 命令%s  %s已配置%s\n' \
-            "$UI_BOLD" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        if prompt_yes_no "修改换 IP 命令" "n"; then
-            old_change="$(prompt_value "输入新的换 IP 命令")"
-        fi
+        printf '\n  %s换 IP 命令（当前配置）%s\n' "$UI_BOLD" "$UI_RESET"
+        show_command_block "$old_change"
+        input="$(prompt_value "新的换 IP 命令（回车保留原命令）")"
+        [[ -n "$input" ]] && old_change="$input"
     else
         printf '\n%s执行换 IP%s\n' "$UI_BOLD" "$UI_RESET"
         old_change="$(prompt_value "输入换 IP 命令")"
@@ -2806,7 +2805,7 @@ quick_add_node() {
     FAIL_ROUNDS=3
     GET_IP_TIMEOUT=30
     CHANGE_CMD_TIMEOUT=90
-    COOLDOWN_SECONDS=600
+    COOLDOWN_SECONDS=0
     DDNS_WAIT_TIMEOUT=300
 
     ui_section "2 / 4  可用性检测"
