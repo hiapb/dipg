@@ -7,7 +7,7 @@
 # - Telegram 通知与远程命令控制
 #
 # 运行：
-#   bash dipguard.sh
+#   sudo bash digp.sh
 #   dipguard --daemon
 #   dipguard --check-all
 
@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 APP="dipguard"
-VERSION="3.7.0"
+VERSION="3.8.0"
 
 BASE_DIR="/etc/${APP}"
 NODES_DIR="${BASE_DIR}/nodes"
@@ -34,6 +34,154 @@ SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 # ---------------------------------------------------------------------------
 # 基础函数
 # ---------------------------------------------------------------------------
+
+# 菜单既可能在交互终端中运行，也可能被重定向到日志或脚本中。
+# 只有真正的终端才启用颜色，避免把 ANSI 控制字符写进日志。
+if [[ -t 1 && -t 2 && -z "${NO_COLOR:-}" ]]; then
+    UI_RESET=$'\033[0m'
+    UI_BOLD=$'\033[1m'
+    UI_DIM=$'\033[2m'
+    UI_BLUE=$'\033[38;5;39m'
+    UI_CYAN=$'\033[38;5;80m'
+    UI_GREEN=$'\033[38;5;114m'
+    UI_YELLOW=$'\033[38;5;221m'
+    UI_RED=$'\033[38;5;203m'
+else
+    UI_RESET=""
+    UI_BOLD=""
+    UI_DIM=""
+    UI_BLUE=""
+    UI_CYAN=""
+    UI_GREEN=""
+    UI_YELLOW=""
+    UI_RED=""
+fi
+
+ui_header() {
+    local title="$1" subtitle="${2:-}"
+    printf '\n%s%s%s\n' "$UI_BOLD$UI_BLUE" "$title" "$UI_RESET"
+    [[ -n "$subtitle" ]] && printf '%s%s%s\n' "$UI_DIM" "$subtitle" "$UI_RESET"
+    printf '%s\n' "────────────────────────────────────────────────────────"
+}
+
+ui_section() {
+    printf '\n%s%s%s\n' "$UI_BOLD$UI_CYAN" "$1" "$UI_RESET"
+}
+
+ui_info() {
+    printf '%s•%s %s\n' "$UI_CYAN" "$UI_RESET" "$*"
+}
+
+ui_ok() {
+    printf '%s✓%s %s\n' "$UI_GREEN" "$UI_RESET" "$*"
+}
+
+ui_warn() {
+    printf '%s!%s %s\n' "$UI_YELLOW" "$UI_RESET" "$*" >&2
+}
+
+ui_error() {
+    printf '%s✗%s %s\n' "$UI_RED" "$UI_RESET" "$*" >&2
+}
+
+pause_menu() {
+    local ignored
+    printf '\n%s按回车返回主菜单%s' "$UI_DIM" "$UI_RESET" >&2
+    IFS= read -r ignored || true
+}
+
+trim_input() {
+    local value="${1:-}"
+    value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    printf '%s\n' "$value"
+}
+
+lower_input() {
+    printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
+command_available() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+show_command_block() {
+    local command="$1"
+    if [[ -z "$(trim_input "$command")" ]]; then
+        printf '  （未设置）\n'
+    else
+        printf '%s\n' "$command" | sed 's/^/  /'
+    fi
+}
+
+validate_change_command() {
+    local command="${1:-}" syntax_error
+
+    [[ -n "$(trim_input "$command")" ]] || {
+        ui_error "换 IP 命令为空。"
+        return 1
+    }
+
+    if ! syntax_error="$(bash -n -c "$command" 2>&1)"; then
+        ui_error "换 IP 命令存在 Shell 语法错误："
+        printf '%s\n' "$syntax_error" | sed 's/^/  /' >&2
+        return 1
+    fi
+
+    if ! command_available timeout; then
+        ui_error "当前系统缺少 timeout，命令即使正确也无法执行。请先安装 coreutils。"
+        return 1
+    fi
+
+    if ! command_available flock; then
+        ui_error "当前系统缺少 flock，脚本无法安全防止重复换 IP。请先安装 util-linux。"
+        return 1
+    fi
+
+    return 0
+}
+
+show_change_command_info() {
+    local command="$1" output_file="${2:-}"
+
+    ui_section "换 IP 命令"
+    show_command_block "$command"
+
+    if validate_change_command "$command"; then
+        ui_ok "Shell 语法和基础依赖检查通过；这里不会偷偷真实执行命令。"
+    else
+        return 1
+    fi
+
+    if [[ -n "$output_file" && -f "$output_file" ]]; then
+        ui_section "上次执行输出"
+        if [[ -s "$output_file" ]]; then
+            tail -n 30 "$output_file" | sed 's/^/  /'
+        else
+            printf '  （命令没有输出）\n'
+        fi
+    fi
+}
+
+format_log_line() {
+    local line="$1" color="$UI_DIM" marker="·"
+
+    case "$line" in
+        *失败*|*错误*|*未成功*|*失败：*)
+            color="$UI_RED"
+            marker="✗"
+            ;;
+        *警告*|*达到上限*|*冷却中*|*等待*)
+            color="$UI_YELLOW"
+            marker="!"
+            ;;
+        *成功*|*完成*|*恢复*|*已提交*)
+            color="$UI_GREEN"
+            marker="✓"
+            ;;
+    esac
+
+    printf '%s%s%s %s%s\n' "$color" "$marker" "$UI_RESET" "$line" "$UI_RESET"
+}
 
 require_root() {
     if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -75,6 +223,12 @@ is_uint() {
     [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+canonical_uint() {
+    is_uint "${1:-}" || return 1
+    ((${#1} <= 18)) || return 1
+    printf '%d\n' "$((10#$1))"
+}
+
 is_int() {
     [[ "${1:-}" =~ ^-?[0-9]+$ ]]
 }
@@ -86,20 +240,32 @@ is_ipv4() {
     [[ -n "${a:-}" && -n "${b:-}" && -n "${c:-}" && -n "${d:-}" ]] || return 1
     [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ &&
        "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+    ((${#a} <= 3 && ${#b} <= 3 && ${#c} <= 3 && ${#d} <= 3)) || return 1
+    [[ "$a" == "0" || "$a" != 0* ]] &&
+        [[ "$b" == "0" || "$b" != 0* ]] &&
+        [[ "$c" == "0" || "$c" != 0* ]] &&
+        [[ "$d" == "0" || "$d" != 0* ]] || return 1
 
     ((10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 && 10#$d <= 255))
 }
 
 extract_ipv4() {
-    local text="$1" ip
+    local text="$1" ip found=""
+
+    # 先按“非数字/点”切成完整候选，再严格校验四段，既不会从长数字
+    # 中截出假地址，也不会因前一个无效候选而漏掉后面的有效地址。
     while IFS= read -r ip; do
         if is_ipv4 "$ip"; then
-            printf '%s\n' "$ip"
-            return 0
+            if [[ -z "$found" ]]; then
+                found="$ip"
+            elif [[ "$found" != "$ip" ]]; then
+                return 2
+            fi
         fi
-    done < <(printf '%s\n' "$text" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+    done < <(printf '%s\n' "$text" | tr -cs '0-9.\n' '\n')
 
-    return 1
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' "$found"
 }
 
 format_duration() {
@@ -147,7 +313,9 @@ read_number_state() {
         value="$(cat "$file" 2>/dev/null || echo "$default")"
     fi
 
-    is_uint "$value" || value="$default"
+    if ! value="$(canonical_uint "$value")"; then
+        value="$default"
+    fi
     printf '%s\n' "$value"
 }
 
@@ -166,12 +334,22 @@ load_global() {
 
     # 文件由脚本生成，仅 root 可写。
     # shellcheck disable=SC1090
-    source "$GLOBAL_CONF"
+    if ! source "$GLOBAL_CONF"; then
+        TG_ENABLED=0
+        TG_COMMANDS_ENABLED=0
+        TG_PROXY_ENABLED=0
+        printf 'Telegram 配置文件格式错误，已临时停用：%s\n' "$GLOBAL_CONF" >&2
+    fi
 
-    is_uint "${TG_ENABLED:-}" || TG_ENABLED=0
-    is_uint "${TG_COMMANDS_ENABLED:-}" || TG_COMMANDS_ENABLED=1
-    is_uint "${TG_POLL_INTERVAL:-}" || TG_POLL_INTERVAL=3
-    is_uint "${TG_PROXY_ENABLED:-}" || TG_PROXY_ENABLED=0
+    [[ "${TG_ENABLED:-}" == "0" || "${TG_ENABLED:-}" == "1" ]] || TG_ENABLED=0
+    [[ "${TG_COMMANDS_ENABLED:-}" == "0" ||
+       "${TG_COMMANDS_ENABLED:-}" == "1" ]] || TG_COMMANDS_ENABLED=1
+    [[ "${TG_PROXY_ENABLED:-}" == "0" ||
+       "${TG_PROXY_ENABLED:-}" == "1" ]] || TG_PROXY_ENABLED=0
+
+    TG_POLL_INTERVAL="$(canonical_uint "${TG_POLL_INTERVAL:-}" 2>/dev/null || echo 3)"
+    is_uint "${TG_POLL_INTERVAL:-}" &&
+        ((TG_POLL_INTERVAL >= 2 && TG_POLL_INTERVAL <= 60)) || TG_POLL_INTERVAL=3
 }
 
 save_global() {
@@ -341,6 +519,60 @@ tg_test() {
 # 节点配置
 # ---------------------------------------------------------------------------
 
+normalize_node_config() {
+    local fallback_name="$NODE_ID" key value
+
+    # Bash 会把 08、09 当作非法八进制；配置与交互输入先统一成十进制。
+    for key in \
+        MAX_DAILY CHECK_INTERVAL CHECK_PORT PING_COUNT PING_MIN_REPLIES \
+        PING_TIMEOUT FAIL_ROUNDS GET_IP_TIMEOUT CHANGE_CMD_TIMEOUT \
+        COOLDOWN_SECONDS DDNS_WAIT_TIMEOUT; do
+        value="${!key:-}"
+        if value="$(canonical_uint "$value" 2>/dev/null)"; then
+            printf -v "$key" '%s' "$value"
+        else
+            printf -v "$key" '%s' ""
+        fi
+    done
+
+    NAME="$(trim_input "${NAME:-}")"
+    [[ -n "$NAME" ]] || NAME="$fallback_name"
+
+    [[ "$ENABLED" == "0" || "$ENABLED" == "1" ]] || ENABLED=1
+    is_uint "$MAX_DAILY" || MAX_DAILY=5
+
+    is_uint "$CHECK_INTERVAL" &&
+        ((CHECK_INTERVAL >= 10 && CHECK_INTERVAL <= 86400)) || CHECK_INTERVAL=10
+
+    CHECK_MODE="$(lower_input "$CHECK_MODE")"
+    case "$CHECK_MODE" in
+        ping|tcp|either|both) ;;
+        *) CHECK_MODE="ping" ;;
+    esac
+
+    is_uint "$CHECK_PORT" &&
+        ((CHECK_PORT >= 1 && CHECK_PORT <= 65535)) || CHECK_PORT=443
+    is_uint "$PING_COUNT" &&
+        ((PING_COUNT >= 1 && PING_COUNT <= 20)) || PING_COUNT=3
+    is_uint "$PING_MIN_REPLIES" &&
+        ((PING_MIN_REPLIES >= 1 && PING_MIN_REPLIES <= PING_COUNT)) ||
+        PING_MIN_REPLIES=1
+    is_uint "$PING_TIMEOUT" &&
+        ((PING_TIMEOUT >= 1 && PING_TIMEOUT <= 20)) || PING_TIMEOUT=3
+    is_uint "$FAIL_ROUNDS" &&
+        ((FAIL_ROUNDS >= 1 && FAIL_ROUNDS <= 100)) || FAIL_ROUNDS=3
+
+    is_uint "$GET_IP_TIMEOUT" &&
+        ((GET_IP_TIMEOUT >= 1 && GET_IP_TIMEOUT <= 300)) || GET_IP_TIMEOUT=30
+    is_uint "$CHANGE_CMD_TIMEOUT" &&
+        ((CHANGE_CMD_TIMEOUT >= 1 && CHANGE_CMD_TIMEOUT <= 600)) ||
+        CHANGE_CMD_TIMEOUT=90
+    is_uint "$COOLDOWN_SECONDS" &&
+        ((COOLDOWN_SECONDS <= 86400)) || COOLDOWN_SECONDS=600
+    is_uint "$DDNS_WAIT_TIMEOUT" &&
+        ((DDNS_WAIT_TIMEOUT <= 86400)) || DDNS_WAIT_TIMEOUT=300
+}
+
 load_node() {
     local id="$1"
     node_exists "$id" || return 1
@@ -369,7 +601,14 @@ load_node() {
 
     # 文件由脚本生成，仅 root 可写。
     # shellcheck disable=SC1090
-    source "${NODE_DIR}/config"
+    if ! source "${NODE_DIR}/config"; then
+        log_msg "SYSTEM" "任务配置格式错误，已跳过：${NODE_ID}"
+        return 1
+    fi
+
+    # 旧版本配置或手工修改的异常值不能进入算术判断，否则可能导致整个
+    # 后台循环退出。这里统一回落到安全值，并保证最低回复数不超过次数。
+    normalize_node_config
 
     # v3.5 起，换 IP 后复用正常检测周期，不再单独设置查询间隔。
     # 旧配置中的 IP_POLL_INTERVAL 会被忽略。
@@ -407,7 +646,10 @@ set_enabled() {
     save_node_config "${NODE_DIR}/config"
 
     if [[ "$value" == "1" ]]; then
-        rm -f "${NODE_STATE}/last_check"
+        rm -f \
+            "${NODE_STATE}/last_check" \
+            "${NODE_STATE}/last_check_result" \
+            "${NODE_STATE}/last_check_detail"
         log_msg "$NAME" "任务已启用"
     else
         log_msg "$NAME" "任务已停用"
@@ -418,12 +660,25 @@ run_saved_command() {
     local command_file="$1" timeout_seconds="$2"
     local command
 
+    [[ -r "$command_file" ]] || {
+        printf '命令文件不存在或不可读：%s\n' "$command_file" >&2
+        return 127
+    }
+    command_available timeout || {
+        printf '缺少 timeout 命令，请先安装 coreutils。\n' >&2
+        return 127
+    }
+
     command="$(cat "$command_file")"
+    [[ -n "$(trim_input "$command")" ]] || {
+        printf '命令文件为空：%s\n' "$command_file" >&2
+        return 127
+    }
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}s" bash -lc "$command"
 }
 
 get_current_ip() {
-    local output rc
+    local output rc ip extract_rc
 
     set +e
     output="$(run_saved_command "${NODE_DIR}/get_ip.cmd" "$GET_IP_TIMEOUT" 2>&1)"
@@ -436,7 +691,26 @@ get_current_ip() {
         return 1
     fi
 
-    extract_ipv4 "$output"
+    set +e
+    ip="$(extract_ipv4 "$output")"
+    extract_rc=$?
+    set -e
+
+    if ((extract_rc == 0)); then
+        rm -f "${NODE_STATE}/last_get_ip_error"
+        printf '%s\n' "$ip"
+        return 0
+    fi
+
+    if ((extract_rc == 2)); then
+        printf '%s\n\n%s\n' \
+            "检测到多个不同的 IPv4，无法确定哪一个属于目标 VPS：" \
+            "$output" > "${NODE_STATE}/last_get_ip_error"
+    else
+        printf '%s\n' "$output" > "${NODE_STATE}/last_get_ip_error"
+    fi
+    chmod 600 "${NODE_STATE}/last_get_ip_error"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -445,6 +719,11 @@ get_current_ip() {
 
 ping_reply_count() {
     local ip="$1" output received
+
+    if ! command_available ping; then
+        printf '0\n'
+        return 127
+    fi
 
     set +e
     output="$(ping -n -c "$PING_COUNT" -W "$PING_TIMEOUT" "$ip" 2>&1)"
@@ -467,37 +746,78 @@ ping_reply_count() {
     printf '%s\n' "$received"
 }
 
-ping_ok() {
-    local ip="$1" replies
-    replies="$(ping_reply_count "$ip")"
-    ((replies >= PING_MIN_REPLIES))
-}
-
 tcp_ok() {
     local ip="$1"
+
+    command_available timeout && command_available nc || return 127
     timeout "$((PING_TIMEOUT + 1))" \
         nc -z -w "$PING_TIMEOUT" "$ip" "$CHECK_PORT" >/dev/null 2>&1
 }
 
-check_reachable() {
+probe_reachability() {
     local ip="$1"
+    local ping_pass=0 tcp_pass=0
+
+    LAST_PING_REPLIES="-"
+    LAST_TCP_RESULT="-"
+    LAST_PROBE_ERROR=""
+
+    if [[ "$CHECK_MODE" != "tcp" ]]; then
+        if ! command_available ping; then
+            LAST_PROBE_ERROR="缺少 ping 命令"
+        else
+            LAST_PING_REPLIES="$(ping_reply_count "$ip" || true)"
+            is_uint "$LAST_PING_REPLIES" || LAST_PING_REPLIES=0
+            ((LAST_PING_REPLIES >= PING_MIN_REPLIES)) && ping_pass=1
+        fi
+    fi
+
+    if [[ "$CHECK_MODE" != "ping" ]]; then
+        if ! command_available nc || ! command_available timeout; then
+            [[ -n "$LAST_PROBE_ERROR" ]] && LAST_PROBE_ERROR+="；"
+            LAST_PROBE_ERROR+="缺少 nc 或 timeout 命令"
+        elif tcp_ok "$ip"; then
+            tcp_pass=1
+            LAST_TCP_RESULT="通"
+        else
+            LAST_TCP_RESULT="不通"
+        fi
+    fi
 
     case "$CHECK_MODE" in
         ping)
-            ping_ok "$ip"
+            ((ping_pass == 1))
             ;;
         tcp)
-            tcp_ok "$ip"
+            ((tcp_pass == 1))
             ;;
         either)
-            ping_ok "$ip" || tcp_ok "$ip"
+            ((ping_pass == 1 || tcp_pass == 1))
             ;;
         both)
-            ping_ok "$ip" && tcp_ok "$ip"
+            ((ping_pass == 1 && tcp_pass == 1))
             ;;
         *)
             return 2
             ;;
+    esac
+}
+
+check_reachable() {
+    probe_reachability "$1"
+}
+
+last_probe_summary() {
+    local ping_text tcp_text
+
+    ping_text="Ping ${LAST_PING_REPLIES}/${PING_COUNT}（要求 ${PING_MIN_REPLIES}）"
+    tcp_text="TCP ${CHECK_PORT} ${LAST_TCP_RESULT}"
+
+    case "$CHECK_MODE" in
+        ping) printf '%s\n' "$ping_text" ;;
+        tcp) printf '%s\n' "$tcp_text" ;;
+        either|both) printf '%s；%s\n' "$ping_text" "$tcp_text" ;;
+        *) printf '%s\n' "未知检测模式" ;;
     esac
 }
 
@@ -520,6 +840,8 @@ get_daily_count() {
         count=0
         printf '%s %s\n' "$today" "$count" > "${NODE_STATE}/daily_usage"
         rm -f "${NODE_STATE}/limit_notified_date"
+    else
+        count="$(canonical_uint "$count" 2>/dev/null || echo 0)"
     fi
 
     printf '%s\n' "$count"
@@ -553,18 +875,68 @@ read_pending() {
 
     # 文件由脚本生成，仅 root 可写。
     # shellcheck disable=SC1090
-    source "${NODE_STATE}/pending"
+    source "${NODE_STATE}/pending" || return 1
 
-    is_ipv4 "$OLD_IP" && is_uint "$STARTED_AT"
+    is_ipv4 "$OLD_IP" && is_uint "$STARTED_AT" || return 1
+    STARTED_AT="$(canonical_uint "$STARTED_AT" 2>/dev/null)" || return 1
 }
 
 clear_pending_validation() {
-    rm -f         "${NODE_STATE}/pending_candidate_ip"         "${NODE_STATE}/pending_candidate_failures"         "${NODE_STATE}/pending_limit_wait_date"
+    rm -f \
+        "${NODE_STATE}/pending_candidate_ip" \
+        "${NODE_STATE}/pending_candidate_failures" \
+        "${NODE_STATE}/pending_limit_wait_date"
 }
 
 clear_pending() {
     rm -f "${NODE_STATE}/pending" "${NODE_STATE}/last_pending_poll"
     clear_pending_validation
+}
+
+write_check_result() {
+    local status="$1" detail="${2:-}"
+    printf '%s\n' "$status" > "${NODE_STATE}/last_check_result"
+    printf '%s\n' "$detail" > "${NODE_STATE}/last_check_detail"
+}
+
+node_health_state() {
+    local status last_check age stale_after
+
+    if [[ "$ENABLED" != "1" ]]; then
+        printf '已停用\n'
+        return
+    fi
+
+    if pending_exists && read_pending; then
+        printf '等待新 IP（%s）\n' \
+            "$(format_duration "$(($(date +%s) - STARTED_AT))")"
+        return
+    fi
+
+    status="$(cat "${NODE_STATE}/last_check_result" 2>/dev/null || true)"
+    last_check="$(read_number_state "${NODE_STATE}/last_check" 0)"
+
+    if ((last_check == 0)) || [[ -z "$status" ]]; then
+        printf '尚未检测\n'
+        return
+    fi
+
+    age=$(($(date +%s) - last_check))
+    ((age < 0)) && age=0
+    stale_after=$((CHECK_INTERVAL * 3 + 10))
+
+    case "$status" in
+        ok)
+            if ((age > stale_after)); then
+                printf '检测已过期（%s前）\n' "$(format_duration "$age")"
+            else
+                printf '最近检测正常\n'
+            fi
+            ;;
+        fail) printf '检测失败\n' ;;
+        ip_error) printf 'IP 查询失败\n' ;;
+        *) printf '状态未知\n' ;;
+    esac
 }
 
 notify_daily_limit_once() {
@@ -580,7 +952,7 @@ notify_daily_limit_once() {
     tg_notify "⚠️ 动态 IP 任务达到每日上限
 任务：${NAME} (${NODE_ID})
 今日次数：$(get_daily_count)/${MAX_DAILY}
-当前 IP：$(cat "${NODE_STATE}/last_seen_ip" 2>/dev/null || echo 未知)
+最近 IP：$(cat "${NODE_STATE}/last_seen_ip" 2>/dev/null || echo 未知)
 自动换 IP 已暂停到次日计数重置。"
 }
 
@@ -588,13 +960,32 @@ notify_daily_limit_once() {
 # 换 IP
 # ---------------------------------------------------------------------------
 
-trigger_change() {
+trigger_change() (
+    local change_lock_fd
+
+    if ! command_available flock; then
+        log_msg "$NAME" "缺少 flock，未执行换 IP；请先安装 util-linux"
+        return 6
+    fi
+
+    exec {change_lock_fd}> "${NODE_STATE}/change.lock"
+    if ! flock -n "$change_lock_fd"; then
+        log_msg "$NAME" "另一个换 IP 请求正在处理，本次未重复提交"
+        return 5
+    fi
+
+    trigger_change_impl "$@"
+)
+
+trigger_change_impl() {
     local current_ip="$1"
     local reason="$2"
     local mode="${3:-auto}"
     local allow_pending_retry="${4:-0}"
     local ignore_cooldown="${5:-0}"
-    local count now last_trigger elapsed output rc count_text
+    local count now last_trigger elapsed output rc count_text wait_text request_kind
+
+    [[ "$mode" == "manual" ]] && request_kind="手动" || request_kind="自动"
 
     if pending_exists && [[ "$allow_pending_retry" != "1" ]]; then
         log_msg "$NAME" "已有换 IP 请求正在等待生效，本次不重复提交"
@@ -620,7 +1011,7 @@ trigger_change() {
     fi
 
     printf '%s\n' "$current_ip" > "${NODE_STATE}/last_seen_ip"
-    log_msg "$NAME" "提交换 IP；旧 IP：$current_ip；原因：$reason"
+    log_msg "$NAME" "提交${request_kind}换 IP；旧 IP：$current_ip；原因：$reason"
 
     set +e
     output="$(run_saved_command "${NODE_DIR}/change_ip.cmd" "$CHANGE_CMD_TIMEOUT" 2>&1)"
@@ -642,6 +1033,12 @@ trigger_change() {
         return 1
     fi
 
+    if [[ -n "$(trim_input "$output")" ]]; then
+        log_msg "$NAME" "换 IP 命令返回 0；命令输出已保存到任务状态"
+    else
+        log_msg "$NAME" "换 IP 命令返回 0；命令没有输出"
+    fi
+
     count=$((count + 1))
     set_daily_count "$count"
     printf '%s\n' "$now" > "${NODE_STATE}/last_trigger"
@@ -652,11 +1049,17 @@ trigger_change() {
     clear_pending_validation
     printf '0\n' > "${NODE_STATE}/fail_rounds"
 
+    if ((DDNS_WAIT_TIMEOUT == 0)); then
+        wait_text="持续等待 IP 变化"
+    else
+        wait_text="等待 IP 变化，${DDNS_WAIT_TIMEOUT} 秒未变化则重试"
+    fi
+
     if ((MAX_DAILY == 0)); then
-        log_msg "$NAME" "请求已提交，今日第 ${count} 次（不限次数）；无限期等待 IP 变化"
+        log_msg "$NAME" "请求已提交，今日第 ${count} 次（不限次数）；${wait_text}"
         count_text="${count}（不限次数）"
     else
-        log_msg "$NAME" "请求已提交，今日 ${count}/${MAX_DAILY}；无限期等待 IP 变化"
+        log_msg "$NAME" "请求已提交，今日 ${count}/${MAX_DAILY}；${wait_text}"
         count_text="${count}/${MAX_DAILY}"
     fi
 
@@ -664,15 +1067,16 @@ trigger_change() {
 任务：${NAME} (${NODE_ID})
 旧 IP：${current_ip}
 原因：${reason}
+来源：${request_kind}
 今日次数：${count_text}
-状态：等待新 IP；超时 ${DDNS_WAIT_TIMEOUT} 秒或新 IP 连续不通时自动继续换。"
+状态：${wait_text}；新 IP 连续不通时自动继续换。"
 
     return 0
 }
 
 poll_pending() {
     local current_ip now last_poll elapsed
-    local candidate_ip candidate_failures rc today blocked_date
+    local candidate_ip candidate_failures rc today blocked_date probe_text
 
     read_pending || {
         clear_pending
@@ -698,18 +1102,18 @@ poll_pending() {
     if [[ "$current_ip" == "$OLD_IP" ]]; then
         clear_pending_validation
         elapsed=$((now - STARTED_AT))
-        
+
         today="$(date +%F)"
         blocked_date="$(cat "${NODE_STATE}/pending_limit_wait_date" 2>/dev/null || true)"
 
         if (( DDNS_WAIT_TIMEOUT > 0 && elapsed >= DDNS_WAIT_TIMEOUT )) && [[ "$blocked_date" != "$today" ]]; then
             log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")，超过超时时间 ${DDNS_WAIT_TIMEOUT} 秒，自动重试换 IP"
-            
+
             set +e
             trigger_change "$current_ip" "DDNS 变化超时 (${DDNS_WAIT_TIMEOUT}秒)" "auto" "1" "1"
             rc=$?
             set -e
-            
+
             case "$rc" in
                 0)
                     log_msg "$NAME" "因 DDNS 未变超时，已自动重新提交换 IP"
@@ -725,12 +1129,17 @@ poll_pending() {
         else
             log_msg "$NAME" "DDNS 仍为旧 IP：$current_ip；已等待 $(format_duration "$elapsed")"
         fi
-        
+
         return 0
     fi
 
     # DDNS 已变化，使用任务原有的 Ping/TCP 规则验证新 IP。
     if check_reachable "$current_ip"; then
+        probe_text="$(last_probe_summary)"
+        [[ -n "$LAST_PROBE_ERROR" ]] && probe_text+="；${LAST_PROBE_ERROR}"
+        printf '%s\n' "$now" > "${NODE_STATE}/last_check"
+        write_check_result "ok" "$probe_text"
+
         elapsed=$((now - STARTED_AT))
         clear_pending
         printf '0\n' > "${NODE_STATE}/fail_rounds"
@@ -749,6 +1158,11 @@ poll_pending() {
         return 0
     fi
 
+    probe_text="$(last_probe_summary)"
+    [[ -n "$LAST_PROBE_ERROR" ]] && probe_text+="；${LAST_PROBE_ERROR}"
+    printf '%s\n' "$now" > "${NODE_STATE}/last_check"
+    write_check_result "fail" "$probe_text"
+
     # 新 IP 不可用：对同一个候选 IP 统计连续失败轮数。
     candidate_ip="$(cat "${NODE_STATE}/pending_candidate_ip" 2>/dev/null || true)"
     candidate_failures="$(
@@ -763,9 +1177,11 @@ poll_pending() {
         candidate_failures=$((candidate_failures + 1))
     fi
 
-    printf '%s\n' "$candidate_failures" >         "${NODE_STATE}/pending_candidate_failures"
+    printf '%s\n' "$candidate_failures" > \
+        "${NODE_STATE}/pending_candidate_failures"
 
-    log_msg "$NAME"         "新 IP 检测失败：$current_ip；连续 ${candidate_failures}/${FAIL_ROUNDS} 轮"
+    log_msg "$NAME" \
+        "新 IP 检测失败：$current_ip；连续 ${candidate_failures}/${FAIL_ROUNDS} 轮；${probe_text}"
 
     if ((candidate_failures < FAIL_ROUNDS)); then
         return 0
@@ -781,7 +1197,8 @@ poll_pending() {
         return 0
     fi
 
-    log_msg "$NAME"         "新 IP $current_ip 连续 ${candidate_failures} 轮不可用，自动继续更换 IP"
+    log_msg "$NAME" \
+        "新 IP $current_ip 连续 ${candidate_failures} 轮不可用，自动继续更换 IP"
 
     set +e
     trigger_change \
@@ -821,7 +1238,7 @@ poll_pending() {
 check_node() {
     local id="$1"
     local force_due="${2:-0}"
-    local current_ip now last_check fail_rounds replies lock_fd rc
+    local current_ip now last_check fail_rounds probe_text lock_fd rc
 
     load_node "$id" || return 1
 
@@ -855,6 +1272,7 @@ check_node() {
     printf '%s\n' "$now" > "${NODE_STATE}/last_check"
 
     if ! current_ip="$(get_current_ip)"; then
+        write_check_result "ip_error" "查询命令未返回有效 IPv4"
         log_msg "$NAME" "查询命令未返回有效 IPv4；为避免误换，本轮跳过"
 
         flock -u "$lock_fd"
@@ -867,20 +1285,23 @@ check_node() {
     fail_rounds="$(read_number_state "${NODE_STATE}/fail_rounds" 0)"
 
     if check_reachable "$current_ip"; then
+        probe_text="$(last_probe_summary)"
+        [[ -n "$LAST_PROBE_ERROR" ]] && probe_text+="；${LAST_PROBE_ERROR}"
+        write_check_result "ok" "$probe_text"
+
         if ((fail_rounds > 0)); then
             log_msg "$NAME" "检测恢复：$current_ip；连续失败 ${fail_rounds} -> 0"
         fi
         printf '0\n' > "${NODE_STATE}/fail_rounds"
     else
+        probe_text="$(last_probe_summary)"
+        [[ -n "$LAST_PROBE_ERROR" ]] && probe_text+="；${LAST_PROBE_ERROR}"
+        write_check_result "fail" "$probe_text"
+
         fail_rounds=$((fail_rounds + 1))
         printf '%s\n' "$fail_rounds" > "${NODE_STATE}/fail_rounds"
 
-        replies="-"
-        if [[ "$CHECK_MODE" != "tcp" ]]; then
-            replies="$(ping_reply_count "$current_ip")"
-        fi
-
-        log_msg "$NAME" "检测失败：$current_ip；连续失败 ${fail_rounds}/${FAIL_ROUNDS}；Ping 回复 ${replies}/${PING_COUNT}"
+        log_msg "$NAME" "检测失败：$current_ip；连续失败 ${fail_rounds}/${FAIL_ROUNDS}；${probe_text}"
 
         if ((fail_rounds >= FAIL_ROUNDS)); then
             set +e
@@ -1030,13 +1451,9 @@ node_status_line() {
         daily_text="${count}/${MAX_DAILY}"
     fi
 
-    if pending_exists && read_pending; then
-        state="等待新IP $(format_duration "$(($(date +%s) - STARTED_AT))")"
-    else
-        state="正常"
-    fi
+    state="$(node_health_state)"
 
-    printf '%s | %s | IP:%s | %s | 今日:%s | 失败:%s/%s | %s' \
+    printf '%s | %s | 最近IP:%s | %s | 今日:%s | 失败:%s/%s | %s' \
         "$id" "$NAME" "$ip" "$enabled" "$daily_text" "$fails" "$FAIL_ROUNDS" "$state"
 }
 
@@ -1062,12 +1479,31 @@ tg_list_text() {
 
 tg_node_detail() {
     local id="$1" ip count fails pending_text daily_text ddns_timeout_str
+    local health probe_detail probe_lines
 
     load_node "$id" || return 1
 
     ip="$(cat "${NODE_STATE}/last_seen_ip" 2>/dev/null || echo 未知)"
     count="$(get_daily_count)"
     fails="$(read_number_state "${NODE_STATE}/fail_rounds" 0)"
+    health="$(node_health_state)"
+    probe_detail="$(cat "${NODE_STATE}/last_check_detail" 2>/dev/null || echo 尚无采样)"
+
+    case "$CHECK_MODE" in
+        ping)
+            probe_lines="Ping：${PING_COUNT} 次，至少回复 ${PING_MIN_REPLIES} 次
+Ping 超时：${PING_TIMEOUT} 秒"
+            ;;
+        tcp)
+            probe_lines="TCP 端口：${CHECK_PORT}
+TCP 超时：${PING_TIMEOUT} 秒"
+            ;;
+        either|both)
+            probe_lines="Ping：${PING_COUNT} 次，至少回复 ${PING_MIN_REPLIES} 次
+Ping/TCP 超时：${PING_TIMEOUT} 秒
+TCP 端口：${CHECK_PORT}"
+            ;;
+    esac
 
     if ((MAX_DAILY == 0)); then
         daily_text="${count}/不限"
@@ -1093,13 +1529,13 @@ tg_node_detail() {
 🖥 任务：${NAME} (${NODE_ID})
 
 状态：$([[ "$ENABLED" == "1" ]] && echo "🟢 启用" || echo "⚪ 停用")
-当前 IP：${ip}
+检测状态：${health}
+最近 IP：${ip}
 检测模式：${CHECK_MODE}
 检测周期：${CHECK_INTERVAL} 秒
-Ping：${PING_COUNT} 次，至少回复 ${PING_MIN_REPLIES} 次
-Ping 超时：${PING_TIMEOUT} 秒
+${probe_lines}
+最近采样：${probe_detail}
 连续失败阈值：${fails}/${FAIL_ROUNDS}
-TCP 端口：${CHECK_PORT}
 今日换 IP：${daily_text}
 自动换 IP 冷却：${COOLDOWN_SECONDS} 秒
 
@@ -1395,7 +1831,10 @@ tg_set_node_value() {
         return 1
     }
 
-    key="${key,,}"
+    key="$(lower_input "$key")"
+    if [[ "$key" != "check_mode" ]] && is_uint "$value"; then
+        value="$(canonical_uint "$value" 2>/dev/null || true)"
+    fi
 
     case "$key" in
         max_daily)
@@ -1456,7 +1895,10 @@ tg_set_node_value() {
     esac
 
     save_node_config "${NODE_DIR}/config"
-    rm -f "${NODE_STATE}/last_check"
+    rm -f \
+        "${NODE_STATE}/last_check" \
+        "${NODE_STATE}/last_check_result" \
+        "${NODE_STATE}/last_check_detail"
     printf '已更新：%s=%s\n' "$key" "$value"
 }
 
@@ -1482,7 +1924,10 @@ tg_read_input_state() {
 
     # 文件由脚本生成，仅 root 可写。
     # shellcheck disable=SC1090
-    source "${STATE_DIR}/tg_input"
+    source "${STATE_DIR}/tg_input" || {
+        rm -f "${STATE_DIR}/tg_input"
+        return 1
+    }
 
     [[ -n "$INPUT_CHAT_ID" && -n "$INPUT_NODE_ID" && -n "$INPUT_KEY" ]] ||
         return 1
@@ -1587,7 +2032,7 @@ tg_handle_text() {
     if tg_read_input_state &&
        [[ "$INPUT_CHAT_ID" == "$chat_id" ]]; then
 
-        if [[ "${text,,}" == "cancel" || "$text" == "取消" ]]; then
+        if [[ "$(lower_input "$text")" == "cancel" || "$text" == "取消" ]]; then
             tg_clear_input_state
             tg_send_to "$chat_id" "已取消自定义设置。" "$(tg_main_keyboard)"
             return
@@ -1640,8 +2085,11 @@ tg_handle_callback() {
             tg_show_list "$chat_id" "$message_id"
             ;;
         a)
-            check_all_once || true
-            tg_answer_callback "$callback_id" "全部任务检查完成" "false"
+            if check_all_once; then
+                tg_answer_callback "$callback_id" "全部任务检查完成" "false"
+            else
+                tg_answer_callback "$callback_id" "部分任务查询失败" "true"
+            fi
             tg_show_list "$chat_id" "$message_id"
             ;;
         n)
@@ -1650,8 +2098,14 @@ tg_handle_callback() {
             ;;
         c)
             if node_exists "$id"; then
-                check_node "$id" 1 || true
-                tg_answer_callback "$callback_id" "检测完成" "false"
+                load_node "$id"
+                if [[ "$ENABLED" != "1" ]]; then
+                    tg_answer_callback "$callback_id" "任务已停用，未执行" "true"
+                elif check_node "$id" 1; then
+                    tg_answer_callback "$callback_id" "检测完成" "false"
+                else
+                    tg_answer_callback "$callback_id" "IP 查询失败" "true"
+                fi
                 tg_show_node "$chat_id" "$message_id" "$id"
             else
                 tg_show_list "$chat_id" "$message_id"
@@ -1700,7 +2154,10 @@ tg_handle_callback() {
 
             case "$rc" in
                 0) tg_answer_callback "$callback_id" "换 IP 请求已提交" "true" ;;
+                2) tg_answer_callback "$callback_id" "已有请求正在等待生效" "true" ;;
                 3) tg_answer_callback "$callback_id" "今日次数已达上限" "true" ;;
+                5) tg_answer_callback "$callback_id" "另一个请求正在处理中" "true" ;;
+                6) tg_answer_callback "$callback_id" "缺少 flock 依赖，请先安装 util-linux" "true" ;;
                 *) tg_answer_callback "$callback_id" "提交失败，请查看状态" "true" ;;
             esac
             tg_show_node "$chat_id" "$message_id" "$id"
@@ -1740,6 +2197,8 @@ tg_handle_callback() {
             case "$rc" in
                 0) tg_answer_callback "$callback_id" "已重新提交" "true" ;;
                 3) tg_answer_callback "$callback_id" "今日次数已达上限" "true" ;;
+                5) tg_answer_callback "$callback_id" "另一个请求正在处理中" "true" ;;
+                6) tg_answer_callback "$callback_id" "缺少 flock 依赖，请先安装 util-linux" "true" ;;
                 *) tg_answer_callback "$callback_id" "重新提交失败" "true" ;;
             esac
             tg_show_node "$chat_id" "$message_id" "$id"
@@ -1814,7 +2273,11 @@ tg_handle_callback() {
             if node_exists "$id"; then
                 load_node "$id"
                 clear_pending
-                rm -f "${NODE_STATE}/fail_rounds" "${NODE_STATE}/last_check"
+                rm -f \
+                    "${NODE_STATE}/fail_rounds" \
+                    "${NODE_STATE}/last_check" \
+                    "${NODE_STATE}/last_check_result" \
+                    "${NODE_STATE}/last_check_detail"
                 tg_answer_callback "$callback_id" "运行状态已清除" "false"
                 tg_show_node "$chat_id" "$message_id" "$id"
             fi
@@ -1998,9 +2461,32 @@ daemon_loop() {
 # ---------------------------------------------------------------------------
 
 prompt_default() {
-    local text="$1" default="$2" value
-    read -r -p "${text} [${default}]: " value
+    local text="$1" default="$2" value suffix=""
+    [[ -n "$default" ]] && suffix=" ${UI_DIM}[默认: ${default}]${UI_RESET}"
+
+    printf '%s›%s %s%s: ' "$UI_CYAN" "$UI_RESET" "$text" "$suffix" >&2
+    if ! IFS= read -r value; then
+        printf '%s\n' "$default"
+        return 0
+    fi
+
+    value="$(trim_input "$value")"
     printf '%s\n' "${value:-$default}"
+}
+
+prompt_value() {
+    local text="$1" value
+    printf '%s›%s %s: ' "$UI_CYAN" "$UI_RESET" "$text" >&2
+    IFS= read -r value || return 1
+    trim_input "$value"
+}
+
+prompt_secret() {
+    local text="$1" value
+    printf '%s›%s %s: ' "$UI_CYAN" "$UI_RESET" "$text" >&2
+    IFS= read -r -s value || return 1
+    printf '\n' >&2
+    trim_input "$value"
 }
 
 prompt_yes_no() {
@@ -2013,8 +2499,10 @@ prompt_yes_no() {
     fi
 
     while true; do
-        read -r -p "${text} ${suffix}: " value
-        value="${value,,}"
+        printf '%s›%s %s %s: ' "$UI_CYAN" "$UI_RESET" "$text" "$suffix" >&2
+        IFS= read -r value || value=""
+        value="$(trim_input "$value")"
+        value="$(lower_input "$value")"
 
         if [[ -z "$value" ]]; then
             [[ "$default" == "y" ]]
@@ -2022,22 +2510,22 @@ prompt_yes_no() {
         fi
 
         case "$value" in
-            y|yes) return 0 ;;
-            n|no) return 1 ;;
-            *) echo "请输入 y 或 n。" ;;
+            y|yes|1|是) return 0 ;;
+            n|no|0|否) return 1 ;;
+            *) ui_error "请输入 y/n（也可以输入 是/否）。" ;;
         esac
     done
 }
 
 prompt_uint() {
-    local text="$1" default="$2" value
+    local text="$1" default="$2" value canonical
     while true; do
         value="$(prompt_default "$text" "$default")"
-        if is_uint "$value"; then
-            printf '%s\n' "$value"
+        if canonical="$(canonical_uint "$value" 2>/dev/null)"; then
+            printf '%s\n' "$canonical"
             return
         fi
-        echo "请输入 0 或正整数。"
+        ui_error "请输入 0 或正整数。"
     done
 }
 
@@ -2049,21 +2537,29 @@ prompt_range() {
             printf '%s\n' "$value"
             return
         fi
-        echo "请输入 ${min}-${max}。"
+        ui_error "请输入 ${min}-${max} 之间的数字。"
     done
 }
 
 prompt_mode() {
     local default="$1" value
+
+    printf '%s\n' \
+        "  1) Ping       只使用 ICMP" \
+        "  2) TCP        只检测指定端口" \
+        "  3) 任一正常   Ping 或 TCP 有一个成功即可" \
+        "  4) 两者正常   Ping 和 TCP 必须都成功" >&2
+
     while true; do
-        value="$(prompt_default "检测模式：ping / tcp / either / both" "$default")"
+        value="$(prompt_default "检测模式（1-4，也可输入英文）" "$default")"
+        value="$(lower_input "$value")"
         case "$value" in
-            ping|tcp|either|both)
-                printf '%s\n' "$value"
-                return
-                ;;
+            1|ping) printf 'ping\n'; return ;;
+            2|tcp) printf 'tcp\n'; return ;;
+            3|either) printf 'either\n'; return ;;
+            4|both) printf 'both\n'; return ;;
             *)
-                echo "只能输入 ping、tcp、either 或 both。"
+                ui_error "请选择 1-4，或输入 ping/tcp/either/both。"
                 ;;
         esac
     done
@@ -2110,16 +2606,10 @@ configure_node() {
         DDNS_WAIT_TIMEOUT=300
     fi
 
-    echo
-    echo "╔══════════════════════════════════════════════════════╗"
-    echo "║                  VPS 任务高级设置                    ║"
-    echo "╚══════════════════════════════════════════════════════╝"
-    echo
-    echo "说明：换 IP 后按正常检测周期解析 DDNS，并用相同的"
-    echo "      Ping/TCP 规则验证新 IP。DDNS 未变时只等待；"
-    echo "      新 IP 连续失败达到阈值后会自动继续更换。"
-    echo
-    echo "── ① 基本信息 ───────────────────────────────────────"
+    ui_header "VPS 任务高级设置" "任务标识: ${id} · 直接回车保留当前值"
+    ui_info "换 IP 后按检测周期重新解析，并用相同规则验证新 IP。"
+    ui_info "DDNS 未变化时保持等待；新 IP 连续失败后再次更换。"
+    ui_section "1 / 4  基本信息"
 
     NAME="$(prompt_default "任务显示名称" "$NAME")"
 
@@ -2131,8 +2621,7 @@ configure_node() {
 
     MAX_DAILY="$(prompt_uint "每日最多换 IP 次数，0=不限" "$MAX_DAILY")"
 
-    echo
-    echo "── ② 可用性检测 ─────────────────────────────────────"
+    ui_section "2 / 4  可用性检测"
     CHECK_INTERVAL="$(prompt_range "检测周期（秒）" "$CHECK_INTERVAL" 10 86400)"
     CHECK_MODE="$(prompt_mode "$CHECK_MODE")"
 
@@ -2154,46 +2643,60 @@ configure_node() {
 
     FAIL_ROUNDS="$(prompt_range "连续失败多少轮后自动换 IP" "$FAIL_ROUNDS" 1 100)"
 
-    echo
-    echo "── ③ 换 IP 策略 ─────────────────────────────────────"
+    ui_section "3 / 4  换 IP 策略"
     GET_IP_TIMEOUT="$(prompt_range "查询当前 IP 命令超时（秒）" "$GET_IP_TIMEOUT" 1 300)"
     CHANGE_CMD_TIMEOUT="$(prompt_range "执行换 IP 命令超时（秒）" "$CHANGE_CMD_TIMEOUT" 1 600)"
     COOLDOWN_SECONDS="$(prompt_range "两次自动换 IP 最小间隔（秒），0=不限制" "$COOLDOWN_SECONDS" 0 86400)"
     DDNS_WAIT_TIMEOUT="$(prompt_range "DDNS 未更新超时时间（秒），0=永久等待" "$DDNS_WAIT_TIMEOUT" 0 86400)"
 
-    echo
-    echo "── ④ IP 来源与执行命令 ──────────────────────────────"
-    echo "查询命令必须输出目标 VPS 当前公网 IPv4。"
-    echo "已使用 DDNS 时，可使用："
-    echo "  getent ahostsv4 你的域名 | awk 'NR==1{print \$1}'"
-    echo
+    ui_section "4 / 4  IP 来源与执行命令"
+    ui_info "查询命令必须输出目标 VPS 当前公网 IPv4。"
+    printf '  示例: getent ahostsv4 example.com | awk '\''NR==1{print $1}'\''\n'
 
     if [[ "$editing" == "1" ]]; then
-        echo "当前查询命令：$old_get"
-        read -r -p "新的查询 IP 命令，直接回车保留: " input
+        printf '%s当前查询命令%s\n  %s\n' "$UI_DIM" "$UI_RESET" "$old_get"
+        input="$(prompt_value "新的查询 IP 命令（留空保留）")"
         [[ -n "$input" ]] && old_get="$input"
     else
-        read -r -p "粘贴查询当前 IP 的一行命令: " old_get
+        old_get="$(prompt_value "粘贴查询当前 IP 的一行命令")"
     fi
 
     [[ -n "$old_get" ]] || {
-        echo "查询 IP 命令不能为空。"
+        ui_error "查询 IP 命令不能为空，未保存任何修改。"
         return 1
     }
 
     echo
     if [[ "$editing" == "1" ]]; then
-        echo "当前换 IP 命令：$old_change"
-        read -r -p "新的换 IP 命令，直接回车保留: " input
+        printf '%s当前换 IP 命令%s\n  %s\n' "$UI_DIM" "$UI_RESET" "$old_change"
+        input="$(prompt_value "新的换 IP 命令（留空保留）")"
         [[ -n "$input" ]] && old_change="$input"
     else
-        read -r -p "粘贴执行换 IP 的一行命令: " old_change
+        old_change="$(prompt_value "粘贴执行换 IP 的一行命令")"
     fi
 
     [[ -n "$old_change" ]] || {
-        echo "换 IP 命令不能为空。"
+        ui_error "换 IP 命令不能为空，未保存任何修改。"
         return 1
     }
+
+    validate_change_command "$old_change" || {
+        ui_error "换 IP 命令没有保存，请修正后重试。"
+        return 1
+    }
+
+    ui_section "配置摘要"
+    printf '  名称          %s\n' "$NAME"
+    printf '  检测          每 %s 秒 · %s · 连续失败 %s 轮\n' \
+        "$CHECK_INTERVAL" "$CHECK_MODE" "$FAIL_ROUNDS"
+    printf '  每日上限      %s\n' "$([[ "$MAX_DAILY" == "0" ]] && echo 不限 || echo "${MAX_DAILY} 次")"
+    printf '  换 IP 冷却    %s 秒\n' "$COOLDOWN_SECONDS"
+    printf '  DDNS 超时     %s\n' "$([[ "$DDNS_WAIT_TIMEOUT" == "0" ]] && echo 永久等待 || echo "${DDNS_WAIT_TIMEOUT} 秒")"
+
+    if ! prompt_yes_no "保存以上配置" "y"; then
+        ui_warn "已取消，配置未修改。"
+        return 0
+    fi
 
     mkdir -p "$NODE_DIR" "$NODE_STATE"
     chmod 700 "$NODE_DIR" "$NODE_STATE"
@@ -2203,32 +2706,30 @@ configure_node() {
     printf '%s\n' "$old_change" > "${NODE_DIR}/change_ip.cmd"
     chmod 600 "${NODE_DIR}/get_ip.cmd" "${NODE_DIR}/change_ip.cmd"
 
-    rm -f "${NODE_STATE}/last_check"
-    echo "任务配置已保存：$id"
+    rm -f \
+        "${NODE_STATE}/last_check" \
+        "${NODE_STATE}/last_check_result" \
+        "${NODE_STATE}/last_check_detail"
+    ui_ok "任务配置已保存：$id"
 }
 
 quick_add_node() {
     local id source_type source_value get_cmd change_cmd quoted_value current_ip
-    local keep_failed
 
-    echo
-    echo "========================================================"
-    echo "              快速添加 VPS 任务"
-    echo "========================================================"
-    echo "只需填写：名称、DDNS/查询方式、每日上限、换 IP 命令。"
-    echo "检测参数自动使用推荐值，之后可在菜单 3 中调整。"
-    echo
+    ui_header "快速添加 VPS 任务" "按步骤填写；输入错误会停留在当前项"
+    ui_info "需要准备：DDNS/查询方式，以及可成功执行的换 IP 命令。"
+    ui_section "1 / 4  任务信息"
 
     while true; do
-        read -r -p "任务标识（例如 hkt）: " id
+        id="$(prompt_value "任务标识（例如 hkt）")"
 
         valid_node_id "$id" || {
-            echo "只能使用字母、数字、下划线和短横线，最长 32 位。"
+            ui_error "只能使用字母、数字、下划线和短横线，最长 32 位。"
             continue
         }
 
         node_exists "$id" && {
-            echo "该任务已经存在。"
+            ui_error "任务 ${id} 已存在，请换一个标识。"
             continue
         }
 
@@ -2243,10 +2744,10 @@ quick_add_node() {
     ENABLED=1
     MAX_DAILY="$(prompt_uint "每天最多换 IP 次数，0=不限" "5")"
 
-    # 推荐默认参数，不在快速向导里逐项询问。
+    # 快速向导只询问决定准确性的关键检测项，其余使用稳妥默认值。
     CHECK_INTERVAL=10
-    CHECK_MODE="ping"
-    CHECK_PORT=443
+    CHECK_MODE="either"
+    CHECK_PORT=22
     PING_COUNT=3
     PING_MIN_REPLIES=1
     PING_TIMEOUT=3
@@ -2256,39 +2757,46 @@ quick_add_node() {
     COOLDOWN_SECONDS=600
     DDNS_WAIT_TIMEOUT=300
 
-    echo
-    echo "请选择如何查询这台 VPS 当前的动态 IP："
-    echo "  1) 动态域名 / DDNS（最简单，推荐）"
-    echo "  2) 服务商查询 IP 的 HTTP 接口"
-    echo "  3) 自定义查询命令（高级）"
-    echo
+    ui_section "2 / 4  可用性检测"
+    ui_info "很多 VPS 会禁 Ping，因此默认采用“Ping 或 TCP 任一成功”。"
+    CHECK_MODE="$(prompt_mode "$CHECK_MODE")"
+    if [[ "$CHECK_MODE" != "ping" ]]; then
+        CHECK_PORT="$(prompt_range "目标 VPS 上确认开放的 TCP 端口" "$CHECK_PORT" 1 65535)"
+    fi
+
+    ui_section "3 / 4  当前 IP 来源"
+    printf '%s\n' \
+        "  1) 动态域名 / DDNS（推荐）" \
+        "  2) 服务商返回目标 VPS IP 的 HTTP 接口" \
+        "  3) 自定义查询命令（高级）"
 
     while true; do
-        read -r -p "请选择 [1-3]: " source_type
+        source_type="$(prompt_value "请选择 1-3")"
         case "$source_type" in
             1|2|3) break ;;
-            *) echo "只能输入 1、2 或 3。" ;;
+            *) ui_error "只能输入 1、2 或 3。" ;;
         esac
     done
 
     case "$source_type" in
         1)
             while true; do
-                read -r -p "输入动态域名，例如 hkt.example.com: " source_value
+                source_value="$(prompt_value "动态域名，例如 hkt.example.com")"
                 if [[ "$source_value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]] ||
                     [[ "$source_value" =~ ^[A-Za-z0-9]$ ]]; then
                     break
                 fi
-                echo "域名格式不正确，不要带 http://、路径或端口。"
+                ui_error "域名格式不正确，不要带协议、路径或端口。"
             done
 
             quoted_value="$(printf '%q' "$source_value")"
-            get_cmd="getent ahostsv4 ${quoted_value} | awk 'NR==1{print \$1}'"
+            get_cmd="getent ahostsv4 ${quoted_value} | awk '!seen[\$1]++ {print \$1}'"
             ;;
 
         2)
+            ui_warn "接口必须返回目标 VPS 的 IP；普通“查询本机 IP”网址不能使用。"
             while true; do
-                read -r -p "输入服务商查询当前 IP 的接口 URL: " source_value
+                source_value="$(prompt_value "服务商查询目标 VPS IP 的接口 URL")"
 
                 case "$source_value" in
                     https://myip.ipip.net*|http://myip.ipip.net*|\
@@ -2296,14 +2804,14 @@ quick_add_node() {
                     https://ip.3322.net*|http://ip.3322.net*|\
                     https://4.ipw.cn*|http://4.ipw.cn*|\
                     https://v4.yinghualuo.cn/bejson*|http://v4.yinghualuo.cn/bejson*)
-                        echo "这个网址返回的是调用者本机 IP，不是目标 VPS IP，不能使用。"
+                        ui_error "该网址返回调用者本机 IP，不是目标 VPS IP。"
                         continue
                         ;;
                     http://*|https://*)
                         break
                         ;;
                     *)
-                        echo "必须以 http:// 或 https:// 开头。"
+                        ui_error "URL 必须以 http:// 或 https:// 开头。"
                         ;;
                 esac
             done
@@ -2313,20 +2821,25 @@ quick_add_node() {
             ;;
 
         3)
-            read -r -p "粘贴查询当前 IP 的一行命令: " get_cmd
+            get_cmd="$(prompt_value "粘贴查询当前 IP 的一行命令")"
             [[ -n "$get_cmd" ]] || {
-                echo "查询命令不能为空。"
+                ui_error "查询命令不能为空。"
                 return 1
             }
             ;;
     esac
 
-    echo
-    echo "粘贴你已经可以成功执行的“更换 IP”一行命令。"
-    read -r -p "换 IP 命令: " change_cmd
+    ui_section "4 / 4  换 IP 命令"
+    ui_info "请粘贴已经在当前服务器验证成功的一行命令。"
+    change_cmd="$(prompt_value "换 IP 命令")"
 
     [[ -n "$change_cmd" ]] || {
-        echo "换 IP 命令不能为空。"
+        ui_error "换 IP 命令不能为空。"
+        return 1
+    }
+
+    validate_change_command "$change_cmd" || {
+        ui_error "命令没有保存，请修正后重新添加任务。"
         return 1
     }
 
@@ -2338,63 +2851,43 @@ quick_add_node() {
     printf '%s\n' "$change_cmd" > "${NODE_DIR}/change_ip.cmd"
     chmod 600 "${NODE_DIR}/get_ip.cmd" "${NODE_DIR}/change_ip.cmd"
 
-    rm -f "${NODE_STATE}/last_check"
+    rm -f \
+        "${NODE_STATE}/last_check" \
+        "${NODE_STATE}/last_check_result" \
+        "${NODE_STATE}/last_check_detail"
 
-    echo
-    echo "正在测试 IP 获取……"
+    ui_section "连接测试"
+    ui_info "正在查询目标 VPS 当前 IP…"
 
     load_node "$id"
 
     if current_ip="$(get_current_ip)"; then
         printf '%s\n' "$current_ip" > "${NODE_STATE}/last_seen_ip"
 
-        echo "✅ 添加成功"
-        echo "任务：$NAME ($id)"
-        echo "当前 IP：$current_ip"
-        echo "每日上限：$MAX_DAILY（0=不限）"
-        echo
-        echo "推荐默认检测："
-        echo "  每 10 秒检测一轮"
-        echo "  每轮 Ping 3 次"
-        echo "  至少 1 次回复即正常"
-        echo "  连续失败 3 轮后换 IP"
-        echo "  换 IP 后继续按每 10 秒周期解析 DDNS"
-        echo "  新 IP 通过相同 Ping/TCP 检测后才算完成"
-        echo "  新 IP 连续 3 轮仍不通会自动继续换 IP"
-        echo "  DDNS 超过 300 秒未更新会自动重新换 IP"
+        ui_ok "任务已添加并查询到有效 IPv4。"
+        printf '  任务       %s (%s)\n' "$NAME" "$id"
+        printf '  当前 IP    %s\n' "$current_ip"
+        printf '  检测       每 %s 秒 · %s' "$CHECK_INTERVAL" "$CHECK_MODE"
+        [[ "$CHECK_MODE" != "ping" ]] && printf ' · TCP %s' "$CHECK_PORT"
+        printf '\n'
+        printf '  触发条件   连续失败 %s 轮\n' "$FAIL_ROUNDS"
+        printf '  每日上限   %s\n' "$([[ "$MAX_DAILY" == "0" ]] && echo 不限 || echo "${MAX_DAILY} 次")"
     else
-        echo "⚠️ 任务已保存，但当前没有查询到有效 IPv4。"
-        echo "查询命令输出："
+        ui_warn "查询命令没有返回有效 IPv4。"
+        printf '%s查询命令输出%s\n' "$UI_DIM" "$UI_RESET"
         cat "${NODE_STATE}/last_get_ip_error" 2>/dev/null || true
-        echo
-        echo "请检查动态域名或服务商接口，然后使用菜单 8 重新测试。"
+
+        if prompt_yes_no "仍然保留这个未通过测试的任务" "n"; then
+            ui_warn "任务已保留但不会被视为已验证，请修正后重新测试。"
+        else
+            rm -rf "${NODE_DIR:?}" "${NODE_STATE:?}"
+            ui_info "已取消添加，没有保留无效任务。"
+        fi
     fi
 }
 
-add_node() {
-    local id
-
-    while true; do
-        read -r -p "任务标识（例如 vps1）: " id
-
-        valid_node_id "$id" || {
-            echo "只能使用字母、数字、下划线和短横线，最长 32 位。"
-            continue
-        }
-
-        node_exists "$id" && {
-            echo "该任务已存在。"
-            continue
-        }
-
-        break
-    done
-
-    configure_node "$id" 0
-}
-
 select_node() {
-    local ids=() id index
+    local ids=() id index ip state
 
     while IFS= read -r id; do
         [[ -n "$id" ]] && ids+=("$id")
@@ -2405,22 +2898,43 @@ select_node() {
         return 1
     fi
 
-    echo
+    ui_section "选择任务"
     for index in "${!ids[@]}"; do
         load_node "${ids[$index]}"
-        printf '  %d) %s (%s) [%s]\n' \
+        ip="$(cat "${NODE_STATE}/last_seen_ip" 2>/dev/null || echo 未知)"
+        if pending_exists; then
+            state="等待新 IP"
+        elif [[ "$ENABLED" == "1" ]]; then
+            state="运行中"
+        else
+            state="已停用"
+        fi
+        printf '  %2d) %s (%s)\n' \
             "$((index + 1))" \
             "$NAME" \
-            "${ids[$index]}" \
-            "$([[ "$ENABLED" == "1" ]] && echo 启用 || echo 停用)"
+            "${ids[$index]}"
+        printf '      %s · %s\n' "$ip" "$state"
     done
+    printf '   0) 返回\n'
 
-    read -r -p "请选择任务编号: " index
+    while true; do
+        index="$(prompt_value "输入任务编号")"
+        [[ "$index" == "0" ]] && return 1
 
-    is_uint "$index" || return 1
-    ((index >= 1 && index <= ${#ids[@]})) || return 1
+        if is_uint "$index"; then
+            index="$(canonical_uint "$index" 2>/dev/null || true)"
+            [[ -n "$index" ]] || {
+                ui_error "编号过大。"
+                continue
+            }
+            if ((index >= 1 && index <= ${#ids[@]})); then
+                SELECTED_NODE="${ids[$((index - 1))]}"
+                return 0
+            fi
+        fi
 
-    SELECTED_NODE="${ids[$((index - 1))]}"
+        ui_error "请输入 0-${#ids[@]} 之间的编号。"
+    done
 }
 
 edit_node() {
@@ -2434,15 +2948,15 @@ delete_node() {
     select_node || return
     load_node "$SELECTED_NODE"
 
-    read -r -p "确定删除任务 $NAME ($SELECTED_NODE)？输入 DELETE 确认: " answer
+    answer="$(prompt_value "删除 ${NAME} (${SELECTED_NODE})，输入 DELETE 确认")"
 
     [[ "$answer" == "DELETE" ]] || {
-        echo "已取消。"
+        ui_info "已取消。"
         return
     }
 
     rm -rf "${NODES_DIR:?}/${SELECTED_NODE}" "${STATE_DIR:?}/${SELECTED_NODE}"
-    echo "任务已删除。"
+    ui_ok "任务已删除。"
 }
 
 enable_node_menu() {
@@ -2458,7 +2972,8 @@ disable_node_menu() {
 }
 
 node_status_text() {
-    local id="$1" ip count fails task_state change_state daily_text
+    local id="$1" ip count fails task_state change_state daily_text last_check
+    local health probe_detail
 
     load_node "$id"
 
@@ -2473,6 +2988,8 @@ node_status_text() {
     fi
 
     task_state="$([[ "$ENABLED" == "1" ]] && echo 启用 || echo 停用)"
+    health="$(node_health_state)"
+    probe_detail="$(cat "${NODE_STATE}/last_check_detail" 2>/dev/null || true)"
 
     if pending_exists && read_pending; then
         change_state="等待新IP $(format_duration "$(($(date +%s) - STARTED_AT))")"
@@ -2480,78 +2997,108 @@ node_status_text() {
         change_state="无"
     fi
 
-    printf '%-11s %-16s %-15s %-6s %-10s %-9s %-20s\n' \
-        "$id" \
-        "$NAME" \
-        "$ip" \
-        "$task_state" \
-        "$daily_text" \
-        "${fails}/${FAIL_ROUNDS}" \
-        "$change_state"
+    last_check="$(read_number_state "${NODE_STATE}/last_check" 0)"
+
+    printf '%s%s%s  %s%s%s\n' "$UI_BOLD" "$NAME" "$UI_RESET" "$UI_DIM" "(${id})" "$UI_RESET"
+    printf '  任务       %s\n' "$task_state"
+    printf '  检测状态   %s\n' "$health"
+    printf '  最近 IP    %s\n' "$ip"
+    printf '  检测       %s · 每 %s 秒' "$CHECK_MODE" "$CHECK_INTERVAL"
+    [[ "$CHECK_MODE" != "ping" ]] && printf ' · TCP %s' "$CHECK_PORT"
+    printf '\n'
+    printf '  失败轮数   %s/%s\n' "$fails" "$FAIL_ROUNDS"
+    printf '  今日换 IP  %s\n' "$daily_text"
+    printf '  换 IP 状态 %s\n' "$change_state"
+    [[ -n "$probe_detail" ]] && printf '  最近采样   %s\n' "$probe_detail"
+    if ((last_check > 0)); then
+        printf '  上次检测   %s\n' "$(date -d "@${last_check}" '+%F %T' 2>/dev/null || echo "$last_check")"
+    else
+        printf '  上次检测   尚未检测\n'
+    fi
 }
 
 list_nodes() {
     local id found=0
 
-    echo
-    printf '%-11s %-16s %-15s %-6s %-10s %-9s %-20s\n' \
-        "标识" "名称" "最近IP" "任务" "今日次数" "失败轮数" "换IP状态"
-    printf '%s\n' "------------------------------------------------------------------------------------------"
+    ui_header "任务状态" "状态文件中的最近结果；“立即测试”可获取实时结果"
 
     while IFS= read -r id; do
         [[ -n "$id" ]] || continue
-        found=1
+        found=$((found + 1))
+        ((found > 1)) && printf '%s\n' "────────────────────────────────────────────────────────"
         node_status_text "$id"
     done < <(node_ids)
 
-    ((found == 1)) || echo "尚未添加任务。"
+    ((found > 0)) || ui_info "尚未添加任务。"
 }
 
 test_node() {
-    local ip replies
+    local ip result probe_text
 
     select_node || return
     load_node "$SELECTED_NODE"
 
-    echo "查询当前 IP……"
+    ui_header "实时测试" "任务: ${NAME} (${SELECTED_NODE})"
+    ui_info "正在执行 IP 查询命令…"
     if ! ip="$(get_current_ip)"; then
-        echo "查询失败。命令输出："
+        ui_error "没有查询到有效 IPv4。原始输出如下："
         cat "${NODE_STATE}/last_get_ip_error" 2>/dev/null || true
         return 1
     fi
 
-    echo "当前 IP：$ip"
-    echo "执行检测……"
-
     if check_reachable "$ip"; then
-        echo "结果：正常"
+        result="正常"
     else
-        echo "结果：失败"
+        result="失败"
     fi
 
-    if [[ "$CHECK_MODE" != "tcp" ]]; then
-        replies="$(ping_reply_count "$ip")"
-        echo "Ping 回复：${replies}/${PING_COUNT}"
-        echo "最低要求：${PING_MIN_REPLIES}/${PING_COUNT}"
-    fi
+    probe_text="$(last_probe_summary)"
+    [[ -n "$LAST_PROBE_ERROR" ]] && probe_text+="；${LAST_PROBE_ERROR}"
+
+    [[ "$result" == "正常" ]] && ui_ok "实时检测正常" || ui_error "实时检测失败"
+    printf '  当前 IP    %s\n' "$ip"
+    printf '  检测模式   %s\n' "$CHECK_MODE"
+    printf '  探测明细   %s\n' "$probe_text"
+    printf '  采样时间   %s\n' "$(date '+%F %T')"
 }
 
 manual_check_menu() {
     select_node || return
-    check_node "$SELECTED_NODE" 1 || true
-    echo "检查完成，请查看状态或日志。"
+    load_node "$SELECTED_NODE"
+    if [[ "$ENABLED" != "1" ]]; then
+        ui_warn "任务已停用，本次不会运行自动检查；请使用“实时测试”做无副作用探测。"
+        return 1
+    fi
+    if check_node "$SELECTED_NODE" 1; then
+        ui_ok "自动检查已完成，失败计数和换 IP 策略已按结果处理。"
+    else
+        ui_error "自动检查未完成：当前 IP 查询失败，请查看任务状态中的原始错误。"
+        return 1
+    fi
 }
 
 manual_change_menu() {
-    local ip rc answer
+    local ip rc retry_pending=0 change_command after_ip
 
     select_node || return
     load_node "$SELECTED_NODE"
 
+    change_command="$(read_command_file "${NODE_DIR}/change_ip.cmd")"
+    ui_header "换 IP 诊断与执行" "任务: ${NAME} (${SELECTED_NODE})"
+
+    if ! show_change_command_info \
+        "$change_command" \
+        "${NODE_STATE}/last_change_output"; then
+        if ! prompt_yes_no "命令检查未通过，仍然尝试真实执行" "n"; then
+            ui_warn "已取消，本次没有执行换 IP。"
+            return 1
+        fi
+    fi
+
     if pending_exists; then
-        echo "该任务已经在等待 IP 变化。"
+        ui_warn "该任务已经在等待新 IP。重复提交会再次消耗一次每日次数。"
         if ! prompt_yes_no "是否明确重新提交一次换 IP" "n"; then
-            echo "已取消。"
+            ui_info "已取消。"
             return
         fi
         retry_pending=1
@@ -2559,17 +3106,25 @@ manual_change_menu() {
         retry_pending=0
     fi
 
-    echo "今日已换：$(get_daily_count)；每日上限：${MAX_DAILY}（0=不限）"
+    ui_section "执行前确认"
+    printf '  最近 IP     %s\n' \
+        "$(cat "${NODE_STATE}/last_seen_ip" 2>/dev/null || echo 未知)"
+    printf '  今日次数    %s\n' \
+        "$(get_daily_count)/$([[ "$MAX_DAILY" == "0" ]] && echo 不限 || echo "$MAX_DAILY")"
+    printf '  命令超时    %s 秒\n' "$CHANGE_CMD_TIMEOUT"
 
-    if ! prompt_yes_no "立即提交换 IP" "n"; then
-        echo "已取消。"
+    if ! prompt_yes_no "确认执行上面的真实换 IP 命令" "n"; then
+        ui_info "已取消，命令没有执行。"
         return
     fi
 
     if ! ip="$(get_current_ip)"; then
-        echo "查询当前 IP 失败，未执行。"
+        ui_error "查询当前 IP 失败，未执行。"
+        cat "${NODE_STATE}/last_get_ip_error" 2>/dev/null || true
         return 1
     fi
+
+    printf '  执行前 IP    %s\n' "$ip"
 
     set +e
     trigger_change \
@@ -2582,10 +3137,49 @@ manual_change_menu() {
     set -e
 
     case "$rc" in
-        0) echo "换 IP 请求已提交。" ;;
-        3) echo "今日次数已达上限，未提交。" ;;
-        *) echo "未提交或执行失败，请查看日志。" ;;
+        0)
+            ui_ok "命令返回成功，已进入等待新 IP 验证。"
+            ;;
+        2)
+            ui_warn "已有换 IP 请求正在等待生效，本次未重复提交。"
+            ;;
+        3)
+            ui_warn "今日次数已达上限，命令没有执行。"
+            ;;
+        5)
+            ui_warn "另一个换 IP 请求正在处理，本次未重复提交。"
+            ;;
+        6)
+            ui_error "缺少 flock，未执行换 IP；请先安装 util-linux。"
+            ;;
+        *)
+            ui_error "命令未成功提交，退出码：${rc}。"
+            ;;
     esac
+
+    ui_section "执行结果"
+    if ((rc == 2 || rc == 3 || rc == 5 || rc == 6)); then
+        printf '  本次没有执行换 IP 命令。\n'
+    elif [[ -s "${NODE_STATE}/last_change_output" ]]; then
+        tail -n 30 "${NODE_STATE}/last_change_output" | sed 's/^/  /'
+    else
+        printf '  （命令没有输出）\n'
+    fi
+
+    if ((rc == 0)); then
+        ui_info "后台会按检测周期重新查询 IP；看到新 IP 后还会继续执行 Ping/TCP 验证。"
+
+        ui_info "正在立即复查一次当前 IP…"
+        if after_ip="$(get_current_ip)"; then
+            if [[ "$after_ip" == "$ip" ]]; then
+                ui_warn "命令返回 0，但 IP 仍是 ${after_ip}。这不代表换 IP 已生效，后台会继续等待并按超时策略重试。"
+            else
+                ui_ok "已看到 IP 变化：${ip} → ${after_ip}，等待后台完成可用性验证。"
+            fi
+        else
+            ui_warn "命令已返回 0，但立即复查 IP 失败；后台会继续等待。"
+        fi
+    fi
 }
 
 reset_node_state() {
@@ -2597,8 +3191,12 @@ reset_node_state() {
     fi
 
     clear_pending
-    rm -f "${NODE_STATE}/fail_rounds" "${NODE_STATE}/last_check"
-    echo "运行状态已清除。"
+    rm -f \
+        "${NODE_STATE}/fail_rounds" \
+        "${NODE_STATE}/last_check" \
+        "${NODE_STATE}/last_check_result" \
+        "${NODE_STATE}/last_check_detail"
+    ui_ok "运行状态已清除。"
 }
 
 reset_daily_count_menu() {
@@ -2689,7 +3287,7 @@ telegram_setup() {
             echo "当前代理：未设置"
         fi
 
-        read -r -p "输入代理 URL，直接回车保留当前值: " value
+        value="$(prompt_value "输入代理 URL（留空保留当前值）")"
         [[ -n "$value" ]] && TG_PROXY_URL="$value"
 
         case "$TG_PROXY_URL" in
@@ -2713,7 +3311,7 @@ telegram_setup() {
         echo "当前 Bot Token：未设置"
     fi
 
-    read -r -p "粘贴新的 Bot Token，直接回车保留: " value
+    value="$(prompt_secret "粘贴新的 Bot Token（留空保留）")"
     [[ -n "$value" ]] && TG_BOT_TOKEN="$value"
 
     if [[ -z "$TG_BOT_TOKEN" ]]; then
@@ -2726,7 +3324,7 @@ telegram_setup() {
 
     echo
     echo "当前 Chat ID：${TG_CHAT_ID:-未设置}"
-    read -r -p "输入新的 Chat ID；输入 auto 自动获取；直接回车保留: " value
+    value="$(prompt_value "新的 Chat ID（auto 自动获取，留空保留）")"
 
     if [[ "$value" == "auto" ]]; then
         echo "请先给机器人发送一次 /start，然后按回车继续。"
@@ -2941,10 +3539,33 @@ service_status() {
 }
 
 show_logs() {
-    echo
-    echo "按 Ctrl+C 退出实时日志。"
-    sleep 1
-    tail -n 100 -f "$LOG_FILE"
+    local line
+
+    if [[ ! -f "$LOG_FILE" ]]; then
+        ui_warn "日志文件尚不存在：$LOG_FILE"
+        return 1
+    fi
+
+    ui_header "运行日志" "最近 120 条；颜色按成功、等待、失败分类"
+    if [[ ! -s "$LOG_FILE" ]]; then
+        ui_info "日志为空。"
+    else
+        while IFS= read -r line; do
+            format_log_line "$line"
+        done < <(tail -n 120 "$LOG_FILE")
+    fi
+
+    if ! prompt_yes_no "继续实时跟踪新日志" "n"; then
+        return 0
+    fi
+
+    ui_info "实时跟踪中，按 Ctrl+C 返回菜单。"
+    set +e
+    tail -n 0 -f "$LOG_FILE" |
+        while IFS= read -r line; do
+            format_log_line "$line"
+        done
+    set -e
 }
 
 remove_program_files() {
@@ -2982,7 +3603,7 @@ uninstall_all() {
     echo
 
     while true; do
-        read -r -p "请输入选项 [0-2]: " choice
+        choice="$(prompt_value "请选择 0-2")"
         case "$choice" in
             0)
                 echo "已取消。"
@@ -2992,7 +3613,7 @@ uninstall_all() {
                 break
                 ;;
             *)
-                echo "只能输入 0、1 或 2。"
+                ui_error "只能输入 0、1 或 2。"
                 ;;
         esac
     done
@@ -3011,7 +3632,7 @@ uninstall_all() {
         return 0
     fi
 
-    read -r -p "彻底删除全部数据，请输入 DELETE 确认: " answer
+    answer="$(prompt_value "彻底删除全部数据，输入 DELETE 确认")"
     if [[ "$answer" != "DELETE" ]]; then
         echo "确认内容不正确，已取消。"
         return 0
@@ -3062,101 +3683,130 @@ uninstall_all() {
 # 菜单
 # ---------------------------------------------------------------------------
 
+menu_overview() {
+    local id total=0 enabled=0 pending=0 service_state="未安装"
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        total=$((total + 1))
+        load_node "$id" || continue
+        [[ "$ENABLED" == "1" ]] && enabled=$((enabled + 1))
+        pending_exists && pending=$((pending + 1))
+    done < <(node_ids)
+
+    if command_available systemctl && systemctl is-active --quiet "$APP" 2>/dev/null; then
+        service_state="运行中"
+    elif command_available systemctl && systemctl list-unit-files "${APP}.service" 2>/dev/null |
+        grep -q "${APP}.service"; then
+        service_state="已停止"
+    fi
+
+    printf '任务 %s 个 · 启用 %s 个 · 等待新 IP %s 个 · 服务 %s\n' \
+        "$total" "$enabled" "$pending" "$service_state"
+}
+
 menu() {
-    local choice
+    local choice normalized_choice
 
     while true; do
-        clear || true
+        [[ -t 1 ]] && clear
 
-        cat <<EOF
-========================================================
-        Dynamic IP Guard v${VERSION}
-========================================================
-  1) 安装/更新程序并启动服务
+        printf '\n%s╭────────────────────────────────────────────────────────╮%s\n' "$UI_BLUE" "$UI_RESET"
+        printf '%s│%s  %s动态 IP 守护%s  v%s\n' "$UI_BLUE" "$UI_RESET" "$UI_BOLD" "$UI_RESET" "$VERSION"
+        printf '%s│%s  %s\n' "$UI_BLUE" "$UI_RESET" "$(menu_overview)"
+        printf '%s╰────────────────────────────────────────────────────────╯%s\n' "$UI_BLUE" "$UI_RESET"
 
-  2) 快速添加 VPS 任务（推荐）
-  3) 高级修改 VPS 任务及全部参数
-  4) 删除 VPS 任务
-  5) 启用 VPS 任务
-  6) 停用 VPS 任务
-  7) 查看任务列表与状态
+        ui_section "主菜单"
+        printf '  %s1)%s  安装 / 更新服务\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s2)%s  新建 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s3)%s  编辑 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s4)%s  删除 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s5)%s  启用 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s6)%s  停用 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s7)%s  任务总览\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s8)%s  单次实时探测（不改状态）\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s9)%s  执行一次自动检查\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s10)%s  手动更换 IP\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s11)%s  清除运行状态\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s12)%s  重置今日换 IP 次数\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s13)%s  Telegram 通知设置\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s14)%s  发送 Telegram 测试\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s15)%s  Telegram 使用说明\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s16)%s  检查全部任务\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s17)%s  查看运行日志\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s18)%s  查看服务状态\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s19)%s  重启后台服务\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s20)%s  停止后台服务\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s21)%s  启动后台服务\n' "$UI_CYAN" "$UI_RESET"
+        printf ' %s22)%s  卸载程序\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s0)%s  退出\n' "$UI_CYAN" "$UI_RESET"
+        printf '\n%s提示：10 会先检查命令，再确认真实执行；17 可查看最近日志并实时跟踪。%s\n' \
+            "$UI_DIM" "$UI_RESET"
 
-  8) 立即测试一个任务
-  9) 立即检查一个任务
- 10) 立即提交/重新提交换 IP
- 11) 清除等待状态和失败计数
- 12) 清零一个任务今日换 IP 次数
-
- 13) 设置/关闭 Telegram 机器人
- 14) 测试 Telegram 连接与通知
- 15) 查看 Telegram 按钮说明
-
- 16) 立即检查全部启用任务
- 17) 查看实时日志
- 18) 查看服务状态
- 19) 重启后台服务
- 20) 停止后台服务
- 21) 启动后台服务
- 22) 卸载程序
-
-  0) 退出
-========================================================
-EOF
-
-        read -r -p "请输入选项 [0-22]: " choice
+        if ! choice="$(prompt_value "请输入编号（0-22）")"; then
+            printf '\n'
+            exit 0
+        fi
+        if normalized_choice="$(canonical_uint "$choice" 2>/dev/null)"; then
+            choice="$normalized_choice"
+        fi
 
         case "$choice" in
             1)
                 install_service
                 ;;
             2)
-                quick_add_node
-                systemctl restart "$APP" 2>/dev/null || true
+                if quick_add_node; then
+                    systemctl restart "$APP" 2>/dev/null || true
+                fi
                 ;;
             3)
-                edit_node
-                systemctl restart "$APP" 2>/dev/null || true
+                if edit_node; then
+                    systemctl restart "$APP" 2>/dev/null || true
+                fi
                 ;;
             4)
-                delete_node
-                systemctl restart "$APP" 2>/dev/null || true
+                if delete_node; then
+                    systemctl restart "$APP" 2>/dev/null || true
+                fi
                 ;;
             5)
-                enable_node_menu
+                enable_node_menu || true
                 ;;
             6)
-                disable_node_menu
+                disable_node_menu || true
                 ;;
             7)
                 list_nodes
                 ;;
             8)
-                test_node
+                test_node || true
                 ;;
             9)
-                manual_check_menu
+                manual_check_menu || true
                 ;;
             10)
-                manual_change_menu
+                manual_change_menu || true
                 ;;
             11)
-                reset_node_state
+                reset_node_state || true
                 ;;
             12)
-                reset_daily_count_menu
+                reset_daily_count_menu || true
                 ;;
             13)
-                telegram_setup
-                systemctl restart "$APP" 2>/dev/null || true
+                if telegram_setup; then
+                    systemctl restart "$APP" 2>/dev/null || true
+                fi
                 ;;
             14)
-                tg_test
+                tg_test || true
                 ;;
             15)
                 telegram_show_buttons_info
                 ;;
             16)
-                check_all_once
+                check_all_once || ui_warn "部分任务检查失败，请查看状态或日志。"
                 ;;
             17)
                 show_logs
@@ -3165,16 +3815,25 @@ EOF
                 service_status
                 ;;
             19)
-                systemctl restart "$APP"
-                echo "后台服务已重启。"
+                if systemctl restart "$APP"; then
+                    ui_ok "后台服务已重启。"
+                else
+                    ui_error "重启失败，请先安装程序或查看服务状态。"
+                fi
                 ;;
             20)
-                systemctl stop "$APP"
-                echo "后台服务已停止。"
+                if systemctl stop "$APP"; then
+                    ui_ok "后台服务已停止。"
+                else
+                    ui_error "停止失败，请查看服务状态。"
+                fi
                 ;;
             21)
-                systemctl start "$APP"
-                echo "后台服务已启动。"
+                if systemctl start "$APP"; then
+                    ui_ok "后台服务已启动。"
+                else
+                    ui_error "启动失败，请先安装程序或查看服务状态。"
+                fi
                 ;;
             22)
                 uninstall_all
@@ -3183,18 +3842,42 @@ EOF
                 exit 0
                 ;;
             *)
-                echo "无效选项。"
+                ui_error "无效选项，请输入 0-22。"
                 ;;
         esac
 
-        echo
-        read -r -p "按回车继续……" _
+        pause_menu
     done
 }
 
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+用法：$0 [选项]
+
+  --daemon     运行后台监控循环
+  --check-all  立即检查全部启用任务
+  --version    显示版本
+  --help       显示帮助
+
+不带选项时打开交互菜单。
+EOF
+}
+
+# 只读参数不要求 root，也不应创建 /etc、/var 下的运行目录。
+case "${1:-}" in
+    --version)
+        echo "$VERSION"
+        exit 0
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+esac
 
 require_root
 ensure_dirs
@@ -3206,14 +3889,11 @@ case "${1:-}" in
     --check-all)
         check_all_once
         ;;
-    --version)
-        echo "$VERSION"
-        ;;
     "")
         menu
         ;;
     *)
-        echo "用法：$0 [--daemon|--check-all|--version]"
+        usage >&2
         exit 1
         ;;
 esac
