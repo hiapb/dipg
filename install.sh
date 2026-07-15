@@ -3723,7 +3723,7 @@ menu() {
         printf '  %s5)%s  启用 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
         printf '  %s6)%s  停用 VPS 任务\n' "$UI_CYAN" "$UI_RESET"
         printf '  %s7)%s  任务总览\n' "$UI_CYAN" "$UI_RESET"
-        printf '  %s8)%s  单次实时探测（不改状态）\n' "$UI_CYAN" "$UI_RESET"
+        printf '  %s8)%s  单次实时探测\n' "$UI_CYAN" "$UI_RESET"
         printf '  %s9)%s  执行一次自动检查\n' "$UI_CYAN" "$UI_RESET"
         printf ' %s10)%s  手动更换 IP\n' "$UI_CYAN" "$UI_RESET"
         printf ' %s11)%s  清除运行状态\n' "$UI_CYAN" "$UI_RESET"
