@@ -15,7 +15,6 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 APP="dipguard"
-VERSION="3.8.0"
 
 BASE_DIR="/etc/${APP}"
 NODES_DIR="${BASE_DIR}/nodes"
@@ -2435,7 +2434,7 @@ tg_poll_once() {
 daemon_loop() {
     local id now last_tg_poll
 
-    log_msg "SYSTEM" "dipguard ${VERSION} 后台服务启动"
+    log_msg "SYSTEM" "dipguard 后台服务启动"
 
     while true; do
         while IFS= read -r id; do
@@ -3712,7 +3711,7 @@ menu() {
         [[ -t 1 ]] && clear
 
         printf '\n%s╭────────────────────────────────────────────────────────╮%s\n' "$UI_BLUE" "$UI_RESET"
-        printf '%s│%s  %s动态 IP 守护%s  v%s\n' "$UI_BLUE" "$UI_RESET" "$UI_BOLD" "$UI_RESET" "$VERSION"
+        printf '%s│%s  %s动态 IP 守护%s\n' "$UI_BLUE" "$UI_RESET" "$UI_BOLD" "$UI_RESET"
         printf '%s│%s  %s\n' "$UI_BLUE" "$UI_RESET" "$(menu_overview)"
         printf '%s╰────────────────────────────────────────────────────────╯%s\n' "$UI_BLUE" "$UI_RESET"
 
@@ -3740,7 +3739,6 @@ menu() {
         printf ' %s21)%s  启动后台服务\n' "$UI_CYAN" "$UI_RESET"
         printf ' %s22)%s  卸载程序\n' "$UI_CYAN" "$UI_RESET"
         printf '  %s0)%s  退出\n' "$UI_CYAN" "$UI_RESET"
-            "$UI_DIM" "$UI_RESET"
 
         if ! choice="$(prompt_value "请输入编号（0-22）")"; then
             printf '\n'
@@ -3859,7 +3857,6 @@ usage() {
 
   --daemon     运行后台监控循环
   --check-all  立即检查全部启用任务
-  --version    显示版本
   --help       显示帮助
 
 不带选项时打开交互菜单。
@@ -3868,10 +3865,6 @@ EOF
 
 # 只读参数不要求 root，也不应创建 /etc、/var 下的运行目录。
 case "${1:-}" in
-    --version)
-        echo "$VERSION"
-        exit 0
-        ;;
     --help|-h)
         usage
         exit 0
