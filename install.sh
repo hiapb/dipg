@@ -3740,7 +3740,6 @@ menu() {
         printf ' %s21)%s  启动后台服务\n' "$UI_CYAN" "$UI_RESET"
         printf ' %s22)%s  卸载程序\n' "$UI_CYAN" "$UI_RESET"
         printf '  %s0)%s  退出\n' "$UI_CYAN" "$UI_RESET"
-        printf '\n%s提示：10 会先检查命令，再确认真实执行；17 可查看最近日志并实时跟踪。%s\n' \
             "$UI_DIM" "$UI_RESET"
 
         if ! choice="$(prompt_value "请输入编号（0-22）")"; then
