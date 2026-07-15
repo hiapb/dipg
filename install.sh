@@ -2602,7 +2602,7 @@ configure_node() {
 
         GET_IP_TIMEOUT=30
         CHANGE_CMD_TIMEOUT=90
-        COOLDOWN_SECONDS=600
+        COOLDOWN_SECONDS=0
         DDNS_WAIT_TIMEOUT=300
     fi
 
