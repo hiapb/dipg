@@ -290,6 +290,46 @@ valid_node_id() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]
 }
 
+valid_domain() {
+    local domain="${1:-}" label
+    local labels=()
+
+    [[ -n "$domain" && ${#domain} -le 253 ]] || return 1
+    [[ "$domain" != .* && "$domain" != *. && "$domain" != *..* ]] || return 1
+
+    IFS='.' read -r -a labels <<< "$domain"
+    ((${#labels[@]} >= 2)) || return 1
+
+    for label in "${labels[@]}"; do
+        [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+domain_from_get_command() {
+    local command="$1" domain
+
+    domain="$(
+        printf '%s\n' "$command" |
+            sed -nE 's#^[[:space:]]*getent[[:space:]]+ahostsv4[[:space:]]+([^[:space:]|;]+).*$#\1#p' |
+            head -n 1
+    )"
+    domain="$(trim_input "$domain")"
+    domain="${domain#\'}"
+    domain="${domain%\'}"
+    domain="${domain#\"}"
+    domain="${domain%\"}"
+
+    valid_domain "$domain" || return 1
+    printf '%s\n' "$domain"
+}
+
+domain_get_command() {
+    local domain="$1" quoted
+    quoted="$(printf '%q' "$domain")"
+    printf "getent ahostsv4 %s | awk '!seen[\$1]++ {print \$1}'\n" "$quoted"
+}
+
 node_exists() {
     [[ -f "${NODES_DIR}/$1/config" ]]
 }
@@ -2575,12 +2615,13 @@ read_command_file() {
 
 configure_node() {
     local id="$1" editing="${2:-0}"
-    local old_get="" old_change="" input
+    local old_get="" old_change="" input domain=""
 
     if [[ "$editing" == "1" ]]; then
         load_node "$id"
         old_get="$(read_command_file "${NODE_DIR}/get_ip.cmd")"
         old_change="$(read_command_file "${NODE_DIR}/change_ip.cmd")"
+        domain="$(domain_from_get_command "$old_get" 2>/dev/null || true)"
     else
         NODE_ID="$id"
         NODE_DIR="${NODES_DIR}/${id}"
@@ -2648,16 +2689,26 @@ configure_node() {
     COOLDOWN_SECONDS="$(prompt_range "两次自动换 IP 最小间隔（秒），0=不限制" "$COOLDOWN_SECONDS" 0 86400)"
     DDNS_WAIT_TIMEOUT="$(prompt_range "DDNS 未更新超时时间（秒），0=永久等待" "$DDNS_WAIT_TIMEOUT" 0 86400)"
 
-    ui_section "4 / 4  IP 来源与执行命令"
-    ui_info "查询命令必须输出目标 VPS 当前公网 IPv4。"
-    printf '  示例: getent ahostsv4 example.com | awk '\''NR==1{print $1}'\''\n'
+    ui_section "4 / 4  动态域名与换 IP"
 
-    if [[ "$editing" == "1" ]]; then
-        printf '%s当前查询命令%s\n  %s\n' "$UI_DIM" "$UI_RESET" "$old_get"
-        input="$(prompt_value "新的查询 IP 命令（留空保留）")"
-        [[ -n "$input" ]] && old_get="$input"
+    if [[ "$editing" == "1" && -n "$domain" ]]; then
+        while true; do
+            input="$(prompt_default "动态域名" "$domain")"
+            valid_domain "$input" && break
+            ui_error "域名格式不正确，例如：vps.example.com"
+        done
+        domain="$input"
+        old_get="$(domain_get_command "$domain")"
+    elif [[ "$editing" == "1" ]]; then
+        ui_warn "当前任务不是标准 DDNS 域名查询，保留现有 IP 查询方式。"
     else
-        old_get="$(prompt_value "粘贴查询当前 IP 的一行命令")"
+        while true; do
+            input="$(prompt_value "动态域名")"
+            valid_domain "$input" && break
+            ui_error "域名格式不正确，例如：vps.example.com"
+        done
+        domain="$input"
+        old_get="$(domain_get_command "$domain")"
     fi
 
     [[ -n "$old_get" ]] || {
@@ -2665,13 +2716,15 @@ configure_node() {
         return 1
     }
 
-    echo
     if [[ "$editing" == "1" ]]; then
-        printf '%s当前换 IP 命令%s\n  %s\n' "$UI_DIM" "$UI_RESET" "$old_change"
-        input="$(prompt_value "新的换 IP 命令（留空保留）")"
-        [[ -n "$input" ]] && old_change="$input"
+        printf '\n  %s换 IP 命令%s  %s已配置%s\n' \
+            "$UI_BOLD" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        if prompt_yes_no "修改换 IP 命令" "n"; then
+            old_change="$(prompt_value "输入新的换 IP 命令")"
+        fi
     else
-        old_change="$(prompt_value "粘贴执行换 IP 的一行命令")"
+        printf '\n%s执行换 IP%s\n' "$UI_BOLD" "$UI_RESET"
+        old_change="$(prompt_value "输入换 IP 命令")"
     fi
 
     [[ -n "$old_change" ]] || {
@@ -2781,15 +2834,13 @@ quick_add_node() {
         1)
             while true; do
                 source_value="$(prompt_value "动态域名，例如 hkt.example.com")"
-                if [[ "$source_value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]] ||
-                    [[ "$source_value" =~ ^[A-Za-z0-9]$ ]]; then
+                if valid_domain "$source_value"; then
                     break
                 fi
                 ui_error "域名格式不正确，不要带协议、路径或端口。"
             done
 
-            quoted_value="$(printf '%q' "$source_value")"
-            get_cmd="getent ahostsv4 ${quoted_value} | awk '!seen[\$1]++ {print \$1}'"
+            get_cmd="$(domain_get_command "$source_value")"
             ;;
 
         2)
